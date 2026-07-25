@@ -4,3 +4,5 @@ numpy
 yfinance
 requests
 plotly
+reportlab
+kaleido==0.2.1
