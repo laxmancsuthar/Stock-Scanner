@@ -634,6 +634,184 @@ def fundamental_score(fund):
 
 
 # =============================================================================
+# SHORT TERM FUNDAMENTALS (QoQ + YoY strict checklist) — Short Term tab only
+# =============================================================================
+# ⚠️ IMPORTANT LIMITATION (padh lo):
+# Promoter holding / FII holding / DII holding ka TREND (intact ya badhta hua)
+# yfinance ya kisi free NSE data source se reliably nahi milta — sirf current
+# snapshot milta hai, history nahi. Isliye ye teeno checks "Manual Check
+# Needed" ke roop me dikhaye jaate hain (score me count nahi hote) — inhe
+# screener.in ya NSE shareholding pattern filing se khud verify karo.
+# "Industry PE" ka bhi koi single official free API nahi hai — is tool me
+# hum scan-universe ke same-sector stocks ka average P/E proxy ke roop me
+# use karte hain (real "industry PE" se thoda different ho sakta hai).
+
+def _series_val(df, *row_names):
+    """Kisi financial statement (income stmt/balance sheet/cashflow) me se
+    ek row Series nikaalta hai. yfinance me columns latest -> oldest order
+    me hote hain (index 0 = sabse latest period)."""
+    if df is None or df.empty:
+        return None
+    for n in row_names:
+        if n in df.index:
+            s = df.loc[n].dropna()
+            if len(s):
+                return s
+    return None
+
+
+def _latest(series, idx=0):
+    if series is None or len(series) <= idx or pd.isna(series.iloc[idx]):
+        return None
+    return float(series.iloc[idx])
+
+
+def _growth_pct(series, a=0, b=1):
+    """series index 0 = sabse latest period. a period ki b period ke mukable growth (%)."""
+    if series is None or len(series) <= max(a, b):
+        return None
+    va, vb = series.iloc[a], series.iloc[b]
+    if pd.isna(va) or pd.isna(vb) or vb == 0:
+        return None
+    return round((va - vb) / abs(vb) * 100, 2)
+
+
+def fetch_short_term_financials(symbol):
+    """Quarterly + Annual financial statements yfinance se fetch karta hai
+    taaki QoQ/YoY fundamental checklist compute ho sake."""
+    try:
+        tk = yf.Ticker(f"{symbol}.NS")
+        data = {
+            "qf": tk.quarterly_financials,
+            "qcf": tk.quarterly_cashflow,
+            "qbs": tk.quarterly_balance_sheet,
+            "af": tk.financials,
+            "acf": tk.cashflow,
+            "abs": tk.balance_sheet,
+            "info": tk.info,
+        }
+    except Exception:
+        return None
+    if data["qf"] is None or data["qf"].empty:
+        return None
+    return data
+
+
+def _opm(op_income_series, sales_series, idx=0):
+    oi, sl = _latest(op_income_series, idx), _latest(sales_series, idx)
+    if oi is None or sl is None or sl == 0:
+        return None
+    return round(oi / sl * 100, 2)
+
+
+def short_term_fundamental_checklist(symbol, fin, sector_avg_pe=None):
+    """
+    User ke diye gaye QoQ + YoY fundamental checklist evaluate karta hai.
+    Returns: (score 0-100, reasons list, checks dict)
+
+    NOTE: Promoter/FII/DII holding checks are NOT included here — free data
+    sources don't reliably expose their historical trend, so rather than show
+    an unscored "manual check" placeholder in the app, they're left out of
+    the scan entirely. Verify those three manually on screener.in / NSE
+    shareholding pattern filings if needed.
+    """
+    checks = {"qoq": {}, "yoy": {}}
+
+    if not fin:
+        return 20, ["❓ Financial statement data nahi mila — manually verify karo"], checks
+
+    qf, qcf, qbs = fin["qf"], fin["qcf"], fin["qbs"]
+    af, acf, abs_ = fin["af"], fin["acf"], fin["abs"]
+    info = fin.get("info") or {}
+
+    # ---- QoQ (quarterly) source rows ----
+    sales_q = _series_val(qf, "Total Revenue", "Operating Revenue")
+    ebitda_q = _series_val(qf, "EBITDA")
+    pat_q = _series_val(qf, "Net Income", "Net Income Common Stockholders")
+    pbt_q = _series_val(qf, "Pretax Income")
+    eps_q = _series_val(qf, "Basic EPS", "Diluted EPS")
+    ocf_q = _series_val(qcf, "Operating Cash Flow", "Cash Flow From Continuing Operating Activities")
+    op_income_q = _series_val(qf, "Operating Income")
+    debt_q = _series_val(qbs, "Total Debt")
+
+    qoq_growth = _growth_pct(sales_q)
+    checks["qoq"]["Sales growth positive (QoQ)"] = None if qoq_growth is None else qoq_growth > 0
+    v = _latest(ebitda_q); checks["qoq"]["EBITDA positive"] = None if v is None else v > 0
+    v = _latest(pat_q); checks["qoq"]["PAT positive"] = None if v is None else v > 0
+    v = _latest(pbt_q); checks["qoq"]["PBT positive"] = None if v is None else v > 0
+    v = _latest(eps_q); checks["qoq"]["EPS positive"] = None if v is None else v > 0
+    v = _latest(ocf_q); checks["qoq"]["CASH (OCF) positive"] = None if v is None else v > 0
+    opm_q0 = _opm(op_income_q, sales_q, 0)
+    checks["qoq"]["OPM positive"] = None if opm_q0 is None else opm_q0 > 0
+    debt_now, debt_prev = _latest(debt_q, 0), _latest(debt_q, 1)
+    checks["qoq"]["Loan kam ya nahi badha"] = (
+        None if (debt_now is None or debt_prev is None) else debt_now <= debt_prev
+    )
+
+    # ---- YoY (annual) source rows ----
+    sales_a = _series_val(af, "Total Revenue", "Operating Revenue")
+    ebitda_a = _series_val(af, "EBITDA")
+    pat_a = _series_val(af, "Net Income", "Net Income Common Stockholders")
+    pbt_a = _series_val(af, "Pretax Income")
+    eps_a = _series_val(af, "Basic EPS", "Diluted EPS")
+    ocf_a = _series_val(acf, "Operating Cash Flow", "Cash Flow From Continuing Operating Activities")
+    op_income_a = _series_val(af, "Operating Income")
+    debt_a = _series_val(abs_, "Total Debt")
+
+    yoy_growth = _growth_pct(sales_a)
+    checks["yoy"]["Sales growth positive (YoY)"] = None if yoy_growth is None else yoy_growth > 0
+    v = _latest(ebitda_a); checks["yoy"]["EBITDA positive"] = None if v is None else v > 0
+    v = _latest(pat_a); checks["yoy"]["PAT positive"] = None if v is None else v > 0
+    v = _latest(pbt_a); checks["yoy"]["PBT positive"] = None if v is None else v > 0
+    v = _latest(eps_a); checks["yoy"]["EPS positive"] = None if v is None else v > 0
+    v = _latest(ocf_a); checks["yoy"]["CASH (OCF) positive"] = None if v is None else v > 0
+    opm_a0 = _opm(op_income_a, sales_a, 0)
+    checks["yoy"]["OPM positive"] = None if opm_a0 is None else opm_a0 > 0
+    debt_a_now, debt_a_prev = _latest(debt_a, 0), _latest(debt_a, 1)
+    checks["yoy"]["Loan kam ya nahi badha"] = (
+        None if (debt_a_now is None or debt_a_prev is None) else debt_a_now <= debt_a_prev
+    )
+
+    roe = info.get("returnOnEquity")
+    roe_pct = round(roe * 100, 1) if roe is not None else None
+    checks["yoy"]["ROE > 20%"] = None if roe_pct is None else roe_pct > 20
+
+    # ROCE approx = EBIT / (Total Assets - Current Liabilities)
+    roce_pct = None
+    try:
+        ebit = _latest(_series_val(af, "EBIT", "Operating Income"))
+        total_assets = _latest(_series_val(abs_, "Total Assets"))
+        curr_liab = _latest(_series_val(abs_, "Current Liabilities", "Total Current Liabilities"))
+        if ebit is not None and total_assets is not None and curr_liab is not None:
+            cap_employed = total_assets - curr_liab
+            if cap_employed:
+                roce_pct = round(ebit / cap_employed * 100, 1)
+    except Exception:
+        roce_pct = None
+    checks["yoy"]["ROCE > 20%"] = None if roce_pct is None else roce_pct > 20
+
+    pe = info.get("trailingPE")
+    pe_label = f"PE < Industry PE ({sector_avg_pe if sector_avg_pe else 'N/A'})"
+    pe_check = None
+    if pe is not None and sector_avg_pe:
+        pe_check = pe < sector_avg_pe
+    checks["yoy"][pe_label] = pe_check
+
+    # ---- Scoring: % of checks passed among checks jinke liye data mila ----
+    all_vals = list(checks["qoq"].values()) + list(checks["yoy"].values())
+    scored_vals = [v for v in all_vals if v is not None]
+    pass_pct = (sum(1 for v in scored_vals if v) / len(scored_vals) * 100) if scored_vals else 30
+
+    reasons = []
+    for k, v in checks["qoq"].items():
+        reasons.append(f"{'✅' if v else ('❌' if v is False else '❓')} QoQ: {k}" + ("" if v is not None else " — data nahi mila"))
+    for k, v in checks["yoy"].items():
+        reasons.append(f"{'✅' if v else ('❌' if v is False else '❓')} YoY: {k}" + ("" if v is not None else " — data nahi mila"))
+
+    return round(pass_pct, 1), reasons, checks
+
+
+# =============================================================================
 # MARKET CONTEXT & RELATIVE STRENGTH
 # =============================================================================
 @st.cache_data(show_spinner=False, ttl=60 * 30)
@@ -834,6 +1012,18 @@ def _pdf_styles():
     }
 
 
+def _pdf_check_line(label, value):
+    """Ek checklist item ko reportlab-safe colored line banata hai.
+    Emoji (✅/❌/❓) reportlab ke default font me black box ban jaate hain,
+    isliye color + text label use karte hain: green=PASS, red=FAIL, grey=N/A."""
+    if value is True:
+        return f'<font color="#1b7a1b"><b>PASS</b></font> — {label}'
+    elif value is False:
+        return f'<font color="#c0392b"><b>FAIL</b></font> — {label}'
+    else:
+        return f'<font color="#888888"><b>N/A</b></font> — {label} (data nahi mila)'
+
+
 def _score_table(r):
     data = [
         ["Composite", "Technical", "Fundamental", "Context"],
@@ -940,7 +1130,19 @@ def build_stock_pdf_elements(r, rank, styles, include_chart=True):
         ]
         for line in fund_lines:
             els.append(Paragraph(line, styles["small"]))
-        if r.get("fundamental_reasons"):
+
+        stchecks = r.get("st_checks")
+        has_st_data = stchecks and (stchecks.get("qoq") or stchecks.get("yoy"))
+        if has_st_data:
+            # Short Term tab result — render QoQ/YoY checklist with color, no emoji
+            els.append(Spacer(1, 4))
+            els.append(Paragraph("<b>Quarter on Quarter (QoQ)</b>", styles["small"]))
+            for k, v in stchecks.get("qoq", {}).items():
+                els.append(Paragraph(_pdf_check_line(k, v), styles["small"]))
+            els.append(Paragraph("<b>Year on Year (YoY)</b>", styles["small"]))
+            for k, v in stchecks.get("yoy", {}).items():
+                els.append(Paragraph(_pdf_check_line(k, v), styles["small"]))
+        elif r.get("fundamental_reasons"):
             els.append(Paragraph("Score reasons: " + "; ".join(r["fundamental_reasons"]), styles["small"]))
     else:
         els.append(Paragraph("Fundamental data nahi mila.", styles["small"]))
@@ -978,7 +1180,7 @@ def generate_pdf_report(results, market_status, market_note, mode_label="Auto Sc
                                styles["meta"]))
     elements.append(Paragraph(f"Market Context (Nifty): {market_status} — {market_note}", styles["meta"]))
     elements.append(Spacer(1, 4))
-    elements.append(Paragraph("⚠️ Sirf research/screening tool hai — financial advice nahi. Apna risk management khud karo.",
+    elements.append(Paragraph("📈 Stocks With Laxman 📈.",
                                styles["warn"]))
     elements.append(Spacer(1, 10))
     elements.append(HRFlowable(width="100%", color=colors.HexColor("#cccccc")))
@@ -998,7 +1200,7 @@ def generate_pdf_report(results, market_status, market_note, mode_label="Auto Sc
 # UI
 # =============================================================================
 st.title("📈 Swing Trade Screener Pro")
-st.warning("⚠️ Sirf research/screening tool hai — financial advice nahi. Apna risk management khud karo.")
+st.warning("📈 Stocks With Laxman 📈.")
 
 market_status, market_note, nifty_df = get_market_context()
 st.info(f"**Market Context (Nifty):** {market_status} — {market_note}")
@@ -1010,299 +1212,553 @@ if "auto_scan_result" not in st.session_state:
 if "custom_scan_result" not in st.session_state:
     st.session_state.custom_scan_result = None
 
-mode = st.radio("Mode choose karo", ["🔍 Auto scan (NSE se khud dhundo)", "📋 Apni list paste karo"], horizontal=True)
 
-if mode.startswith("🔍"):
-    universe_choice = st.selectbox("Universe", list(INDEX_URLS.keys()), index=1)
-    c1, c2, c3, c4 = st.columns(4)
-    min_price = c1.number_input("Min price (₹)", value=20, min_value=1)
-    min_volume = c2.number_input("Min avg volume", value=50000, min_value=0, step=10000)
-    top_n = c3.slider("Top candidates", 1, 15, 5)
-    min_tech_score = c4.slider("Min Technical Score", 0, 70, 25)
+tab1, tab2 = st.tabs(["📈 Swing Trade", "⚡ Short Term"])
 
-    sector_filter = st.multiselect("Sector filter (optional)", [
-        "Technology", "Financial Services", "Consumer Cyclical", "Healthcare",
-        "Industrials", "Consumer Defensive", "Energy", "Basic Materials",
-        "Real Estate", "Communication Services", "Utilities"
-    ])
+with tab1:
+    mode = st.radio("Mode choose karo", ["🔍 Auto scan (NSE se khud dhundo)", "📋 Apni list paste karo"], horizontal=True)
 
-    btn_col1, btn_col2 = st.columns([1, 1])
-    scan_clicked = btn_col1.button("🚀 Scan Shuru Karo", type="primary")
-    clear_clicked = btn_col2.button("🗑️ Clear Results", disabled=st.session_state.auto_scan_result is None)
+    if mode.startswith("🔍"):
+        universe_choice = st.selectbox("Universe", list(INDEX_URLS.keys()), index=1)
+        c1, c2, c3, c4 = st.columns(4)
+        min_price = c1.number_input("Min price (₹)", value=20, min_value=1)
+        min_volume = c2.number_input("Min avg volume", value=50000, min_value=0, step=10000)
+        top_n = c3.slider("Top candidates", 1, 15, 5)
+        min_tech_score = c4.slider("Min Technical Score", 0, 70, 25)
 
-    if clear_clicked:
-        st.session_state.auto_scan_result = None
-        st.rerun()
+        sector_filter = st.multiselect("Sector filter (optional)", [
+            "Technology", "Financial Services", "Consumer Cyclical", "Healthcare",
+            "Industrials", "Consumer Defensive", "Energy", "Basic Materials",
+            "Real Estate", "Communication Services", "Utilities"
+        ])
 
-    if scan_clicked:
-        symbols = get_universe(universe_choice)
-        if not symbols:
-            st.stop()
+        btn_col1, btn_col2 = st.columns([1, 1])
+        scan_clicked = btn_col1.button("🚀 Scan Shuru Karo", type="primary")
+        clear_clicked = btn_col2.button("🗑️ Clear Results", disabled=st.session_state.auto_scan_result is None)
 
-        st.write(f"**{len(symbols)} stocks** scan honge. Bade universe me time lagega ⏳")
-        progress = st.progress(0.0, text="Stage 1: Technical scan chal raha hai...")
-        stage1 = batch_technical_scan(symbols, progress, min_price=min_price, min_avg_volume=min_volume, nifty_df=nifty_df)
-        progress.empty()
+        if clear_clicked:
+            st.session_state.auto_scan_result = None
+            st.rerun()
 
-        # Filter by minimum technical score
-        stage1 = [r for r in stage1 if r["technical_score"] >= min_tech_score]
+        if scan_clicked:
+            symbols = get_universe(universe_choice)
+            if not symbols:
+                st.stop()
 
-        if not stage1:
-            st.error("Koi stock minimum technical score pass nahi kar paya. Filters loosen karo.")
-            st.stop()
+            st.write(f"**{len(symbols)} stocks** scan honge. Bade universe me time lagega ⏳")
+            progress = st.progress(0.0, text="Stage 1: Technical scan chal raha hai...")
+            stage1 = batch_technical_scan(symbols, progress, min_price=min_price, min_avg_volume=min_volume, nifty_df=nifty_df)
+            progress.empty()
 
-        stage1_sorted = sorted(stage1, key=lambda r: r["technical_score"], reverse=True)
-        shortlist = stage1_sorted[:max(25, top_n * 5)]
+            # Filter by minimum technical score
+            stage1 = [r for r in stage1 if r["technical_score"] >= min_tech_score]
 
-        st.write(f"Stage 1 se **{len(shortlist)}** technically strong stocks shortlist hue. Ab fundamentals check ho raha hai...")
-        progress2 = st.progress(0.0, text="Stage 2: Fundamentals check...")
-        final_results = []
+            if not stage1:
+                st.error("Koi stock minimum technical score pass nahi kar paya. Filters loosen karo.")
+                st.stop()
+
+            stage1_sorted = sorted(stage1, key=lambda r: r["technical_score"], reverse=True)
+            shortlist = stage1_sorted[:max(25, top_n * 5)]
+
+            st.write(f"Stage 1 se **{len(shortlist)}** technically strong stocks shortlist hue. Ab fundamentals check ho raha hai...")
+            progress2 = st.progress(0.0, text="Stage 2: Fundamentals check...")
+            final_results = []
+            for i, r in enumerate(shortlist):
+                fund = fetch_fundamentals(r["symbol"])
+                fscore, freasons = fundamental_score(fund)
+                red_flags = check_red_flags(fund, r["df_last_close"])
+
+                # Context score
+                cscore = 0
+                if r["relative_strength"]:
+                    rs, _, _ = r["relative_strength"]
+                    if rs > 5:
+                        cscore += 5
+                    elif rs > 0:
+                        cscore += 3
+
+                composite = round(r["technical_score"] * 0.60 + fscore * 0.30 + cscore * 0.10, 1)
+
+                r.update({
+                    "fundamentals": fund,
+                    "fundamental_score": fscore,
+                    "fundamental_reasons": freasons,
+                    "red_flags": red_flags,
+                    "composite_score": composite,
+                    "context_score": cscore,
+                })
+                final_results.append(r)
+                progress2.progress((i + 1) / len(shortlist))
+            progress2.empty()
+
+            # Sector filter
+            if sector_filter:
+                final_results = [r for r in final_results if r["fundamentals"] and r["fundamentals"].get("sector") in sector_filter]
+
+            top = sorted(final_results, key=lambda r: r["composite_score"], reverse=True)[:top_n]
+
+            # Store in session_state so results survive reruns until Clear is clicked
+            st.session_state.auto_scan_result = {
+                "top": top,
+                "market_status": market_status,
+                "market_note": market_note,
+            }
+
+        # Render from session_state (persists across reruns e.g. position-sizing widget interactions)
+        saved = st.session_state.auto_scan_result
+        if saved:
+            top = saved["top"]
+
+            if top:
+                pdf_bytes = generate_pdf_report(top, saved["market_status"], saved["market_note"], mode_label="Auto Scan")
+                st.download_button("📥 PDF Report Download karo", pdf_bytes, "swing_screener_report.pdf", "application/pdf")
+
+            st.subheader(f"🏆 Top {len(top)} Swing Trade Candidates")
+
+            for rank, r in enumerate(top, start=1):
+                with st.container(border=True):
+                    fund = r["fundamentals"] or {}
+                    col_main, col_score = st.columns([3, 1])
+                    col_main.markdown(f"### #{rank} · {r['symbol']}  <span style='font-size:0.7em;color:gray'>{fund.get('sector','')}</span>", unsafe_allow_html=True)
+                    col_score.metric("Composite Score", f"{r['composite_score']}/100")
+                    col_score.caption(f"Tech: {r['technical_score']} | Fund: {r['fundamental_score']} | Ctx: {r['context_score']}")
+
+                    # Setup tags
+                    setup_html = " ".join([f"<span style='background:#e3f2fd;padding:3px 8px;border-radius:10px;margin-right:5px;font-size:0.8em'>{s}</span>" for s in r["setups"]])
+                    st.markdown(f"**Setup:** {setup_html}", unsafe_allow_html=True)
+
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    c1.metric("Last Close", f"₹{r['df_last_close']}")
+                    c2.metric("RSI", r["rsi14"])
+                    c3.metric("ADX", r["adx14"] or "N/A")
+                    c4.metric("Weekly", "✅" if r["weekly_ok"] else "❌")
+                    c5.metric("Monthly", "✅" if r["monthly_ok"] else "❌")
+
+                    bt = r["breakout"]
+                    st.write(f"**Breakout:** {STATUS_MAP.get(bt['status'], bt['status'])} | Resistance: ₹{bt.get('resistance')} | Support: ₹{bt.get('support')}")
+
+                    rr = r["risk_reward"]
+                    if rr:
+                        st.write(f"**Risk-Reward:** Entry ₹{rr['entry']} | SL ₹{rr['stop_loss']} | Target ₹{rr['target']} | R:R 1:{rr['r_r']} | ATR: {rr['atr_pct']}%")
+
+                    if r["relative_strength"]:
+                        rs, sret, bret = r["relative_strength"]
+                        color = "green" if rs > 0 else "red"
+                        st.write(f"**vs Nifty (60d):** <span style='color:{color};font-weight:bold'>{rs:+.1f}%</span> (Stock: {sret:+.1f}% | Nifty: {bret:+.1f}%)", unsafe_allow_html=True)
+
+                    # Expanders
+                    with st.expander("📊 Technical Reasons"):
+                        for reason in r["technical_reasons"]:
+                            st.write(f"- {reason}")
+                        if r["patterns"]:
+                            st.write(f"- **Patterns:** {', '.join(r['patterns'])}")
+                        if r["divergence"]:
+                            st.write(f"- **Divergence:** {r['divergence']}")
+                        if r["gap"]:
+                            st.write(f"- **Gap:** {r['gap']}")
+
+                    with st.expander("🏛️ Fundamentals"):
+                        if fund:
+                            fcols = st.columns(3)
+                            fcols[0].write(f"**P/E:** {fund.get('pe_ratio')} | **Forward P/E:** {fund.get('forward_pe')}")
+                            fcols[0].write(f"**P/B:** {fund.get('pb_ratio')} | **PEG:** {fund.get('peg_ratio')}")
+                            fcols[1].write(f"**ROE:** {fund.get('roe')}% | **ROA:** {fund.get('roa')}%")
+                            fcols[1].write(f"**Margin:** {fund.get('profit_margin')}% | **Op Margin:** {fund.get('operating_margin')}%")
+                            fcols[2].write(f"**D/E:** {fund.get('debt_to_equity')} | **Current Ratio:** {fund.get('current_ratio')}")
+                            fcols[2].write(f"**Beta:** {fund.get('beta')} | **Div Yield:** {fund.get('dividend_yield')}%")
+                            st.write(f"**Growth:** Revenue {fund.get('revenue_growth')}% | Qtr Earnings {fund.get('earnings_qtr_growth')}%")
+                            st.write(f"**Cash Flow:** FCF ₹{fund.get('free_cashflow')} | OCF ₹{fund.get('operating_cashflow')}")
+                            st.write(f"**Ownership:** Institutions {fund.get('institutional_pct')}% | Insiders {fund.get('insider_pct')}%")
+                            st.write(f"**Analyst Rating:** {fund.get('analyst_rating')}/5 ({fund.get('num_analysts')} analysts)")
+                            st.write(f"**52W Range:** ₹{fund.get('fifty_two_week_low')} - ₹{fund.get('fifty_two_week_high')}")
+                            st.write("**Score reasons:**")
+                            for freason in r["fundamental_reasons"]:
+                                st.write(f"- {freason}")
+                        else:
+                            st.write("Fundamental data nahi mila.")
+
+                    with st.expander("🚩 Red Flags"):
+                        for flag in r["red_flags"]:
+                            st.write(flag)
+
+                    with st.expander("📈 Chart"):
+                        fig = generate_chart(r["raw_df"], r["symbol"], bt, rr)
+                        st.plotly_chart(fig, use_container_width=True, key=f"chart_{r['symbol']}_{rank}")
+
+                    # Position sizing calculator
+                    with st.expander("🧮 Position Sizing Calculator"):
+                        portfolio = st.number_input(f"Portfolio Size (₹) — {r['symbol']}", min_value=10000, value=500000, step=50000, key=f"port_{r['symbol']}_{rank}")
+                        risk_pct = st.slider(f"Risk % per trade — {r['symbol']}", 0.5, 5.0, 1.0, 0.5, key=f"risk_{r['symbol']}_{rank}")
+                        if rr:
+                            max_risk = portfolio * risk_pct / 100
+                            qty = int(max_risk / rr["risk"]) if rr["risk"] > 0 else 0
+                            investment = qty * rr["entry"]
+                            st.success(f"**Qty:** {qty} shares | **Investment:** ₹{investment:,.0f} | **Max Risk:** ₹{max_risk:,.0f}")
+
+            st.caption("📌 Upcoming results/corporate actions khud check kar lo — ye tool sudden news predict nahi karta.")
+
+    else:
+        st.info("Apni list paste karne ke liye niche symbols enter karo (comma separated):")
+        custom_input = st.text_area("Symbols", "RELIANCE, TCS, INFY, HDFCBANK")
+
+        btn_col1, btn_col2 = st.columns([1, 1])
+        custom_scan_clicked = btn_col1.button("Custom List Scan Karo", type="primary")
+        custom_clear_clicked = btn_col2.button("🗑️ Clear Results", key="clear_custom", disabled=st.session_state.custom_scan_result is None)
+
+        if custom_clear_clicked:
+            st.session_state.custom_scan_result = None
+            st.rerun()
+
+        if custom_scan_clicked:
+            custom_symbols = [s.strip().upper() for s in custom_input.split(",") if s.strip()]
+            progress = st.progress(0.0, text="Scanning custom list...")
+            stage1 = batch_technical_scan(custom_symbols, progress, nifty_df=nifty_df)
+            progress.empty()
+
+            if not stage1:
+                st.error("Koi stock criteria pass nahi kiya.")
+                st.stop()
+
+            shortlist = sorted(stage1, key=lambda r: r["technical_score"], reverse=True)
+            for r in shortlist:
+                fund = fetch_fundamentals(r["symbol"])
+                fscore, freasons = fundamental_score(fund)
+                red_flags = check_red_flags(fund, r["df_last_close"])
+                composite = round(r["technical_score"] * 0.6 + fscore * 0.3, 1)
+                r.update({
+                    "fundamentals": fund,
+                    "fundamental_score": fscore,
+                    "fundamental_reasons": freasons,
+                    "red_flags": red_flags,
+                    "composite_score": composite,
+                    "context_score": 0,
+                })
+
+            st.session_state.custom_scan_result = {
+                "shortlist": shortlist,
+                "market_status": market_status,
+                "market_note": market_note,
+            }
+
+        saved_custom = st.session_state.custom_scan_result
+        if saved_custom:
+            shortlist = saved_custom["shortlist"]
+
+            if shortlist:
+                pdf_bytes = generate_pdf_report(shortlist, saved_custom["market_status"], saved_custom["market_note"], mode_label="Custom List Scan")
+                st.download_button("📥 PDF Report Download karo", pdf_bytes, "swing_screener_report.pdf", "application/pdf", key="pdf_custom")
+
+            for rank, r in enumerate(shortlist, start=1):
+                with st.container(border=True):
+                    fund = r["fundamentals"] or {}
+                    col_main, col_score = st.columns([3, 1])
+                    col_main.markdown(f"### #{rank} · {r['symbol']}  <span style='font-size:0.7em;color:gray'>{fund.get('sector','')}</span>", unsafe_allow_html=True)
+                    col_score.metric("Composite Score", f"{r['composite_score']}/100")
+                    col_score.caption(f"Tech: {r['technical_score']} | Fund: {r['fundamental_score']}")
+
+                    setup_html = " ".join([f"<span style='background:#e3f2fd;padding:3px 8px;border-radius:10px;margin-right:5px;font-size:0.8em'>{s}</span>" for s in r["setups"]])
+                    st.markdown(f"**Setup:** {setup_html}", unsafe_allow_html=True)
+
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Last Close", f"₹{r['df_last_close']}")
+                    c2.metric("RSI", r["rsi14"])
+                    c3.metric("ADX", r["adx14"] or "N/A")
+
+                    bt = r["breakout"]
+                    st.write(f"**Breakout:** {STATUS_MAP.get(bt['status'], bt['status'])} | Resistance: ₹{bt.get('resistance')} | Support: ₹{bt.get('support')}")
+
+                    rr = r["risk_reward"]
+                    if rr:
+                        st.write(f"**Risk-Reward:** Entry ₹{rr['entry']} | SL ₹{rr['stop_loss']} | Target ₹{rr['target']} | R:R 1:{rr['r_r']} | ATR: {rr['atr_pct']}%")
+
+                    with st.expander("📊 Technical Reasons"):
+                        for reason in r["technical_reasons"]:
+                            st.write(f"- {reason}")
+                        if r["patterns"]:
+                            st.write(f"- **Patterns:** {', '.join(r['patterns'])}")
+                        if r["divergence"]:
+                            st.write(f"- **Divergence:** {r['divergence']}")
+                        if r["gap"]:
+                            st.write(f"- **Gap:** {r['gap']}")
+
+                    with st.expander("🏛️ Fundamentals"):
+                        if fund:
+                            fcols = st.columns(3)
+                            fcols[0].write(f"**P/E:** {fund.get('pe_ratio')} | **Forward P/E:** {fund.get('forward_pe')}")
+                            fcols[0].write(f"**P/B:** {fund.get('pb_ratio')} | **PEG:** {fund.get('peg_ratio')}")
+                            fcols[1].write(f"**ROE:** {fund.get('roe')}% | **ROA:** {fund.get('roa')}%")
+                            fcols[1].write(f"**Margin:** {fund.get('profit_margin')}% | **Op Margin:** {fund.get('operating_margin')}%")
+                            fcols[2].write(f"**D/E:** {fund.get('debt_to_equity')} | **Current Ratio:** {fund.get('current_ratio')}")
+                            fcols[2].write(f"**Beta:** {fund.get('beta')} | **Div Yield:** {fund.get('dividend_yield')}%")
+                            st.write("**Score reasons:**")
+                            for freason in r["fundamental_reasons"]:
+                                st.write(f"- {freason}")
+                        else:
+                            st.write("Fundamental data nahi mila.")
+
+                    with st.expander("🚩 Red Flags"):
+                        for flag in r["red_flags"]:
+                            st.write(flag)
+
+                    with st.expander("📈 Chart"):
+                        fig = generate_chart(r["raw_df"], r["symbol"], bt, rr)
+                        st.plotly_chart(fig, use_container_width=True, key=f"chart_custom_{r['symbol']}_{rank}")
+
+                    with st.expander("🧮 Position Sizing Calculator"):
+                        portfolio = st.number_input(f"Portfolio Size (₹) — {r['symbol']}", min_value=10000, value=500000, step=50000, key=f"cport_{r['symbol']}_{rank}")
+                        risk_pct = st.slider(f"Risk % per trade — {r['symbol']}", 0.5, 5.0, 1.0, 0.5, key=f"crisk_{r['symbol']}_{rank}")
+                        if rr:
+                            max_risk = portfolio * risk_pct / 100
+                            qty = int(max_risk / rr["risk"]) if rr["risk"] > 0 else 0
+                            investment = qty * rr["entry"]
+                            st.success(f"**Qty:** {qty} shares | **Investment:** ₹{investment:,.0f} | **Max Risk:** ₹{max_risk:,.0f}")
+
+with tab2:
+    st.title("⚡ Short Term Screener")
+    st.warning("⚠️ Sirf research/screening tool hai — financial advice nahi. Apna risk management khud karo.")
+    st.info(f"**Market Context (Nifty):** {market_status} — {market_note}")
+    st.caption(
+        "Technical scanner Swing Trade tab jaisa hi hai. Fundamentals me QoQ + YoY "
+        "checklist add ki gayi hai (Sales/EBITDA/PAT/PBT/EPS/Cash/OPM growth, "
+        "Loan trend, ROE, ROCE, PE vs Industry PE — Industry PE sector-avg proxy hai). "
+        "⚠️ Promoter/FII/DII holding trend ka reliable free data source na hone ki "
+        "wajah se ye 3 checks scan me include nahi kiye gaye hain — inhe screener.in "
+        "ya NSE shareholding pattern filing se khud verify kar lena."
+    )
+
+    if "short_auto_scan_result" not in st.session_state:
+        st.session_state.short_auto_scan_result = None
+    if "short_custom_scan_result" not in st.session_state:
+        st.session_state.short_custom_scan_result = None
+
+    def _score_short_term_batch(shortlist):
+        """Pass 1: fundamentals + financials fetch. Pass 2: sector-avg PE proxy
+        ('Industry PE') compute karke final checklist score nikalna."""
+        enriched = []
+        prog = st.progress(0.0, text="Fundamentals + Financials fetch ho rahe hain...")
         for i, r in enumerate(shortlist):
             fund = fetch_fundamentals(r["symbol"])
-            fscore, freasons = fundamental_score(fund)
+            fin = fetch_short_term_financials(r["symbol"])
+            enriched.append({"r": r, "fund": fund, "fin": fin})
+            prog.progress((i + 1) / len(shortlist))
+        prog.empty()
+
+        sector_pes = {}
+        for e in enriched:
+            f = e["fund"]
+            if f and f.get("sector") and f.get("pe_ratio"):
+                sector_pes.setdefault(f["sector"], []).append(f["pe_ratio"])
+        sector_avg_pe = {sec: round(sum(v) / len(v), 1) for sec, v in sector_pes.items() if len(v) >= 2}
+
+        final_results = []
+        for e in enriched:
+            r, fund, fin = e["r"], e["fund"], e["fin"]
+            sec = fund.get("sector") if fund else None
+            avg_pe = sector_avg_pe.get(sec)
+            stscore, streasons, stchecks = short_term_fundamental_checklist(r["symbol"], fin, avg_pe)
             red_flags = check_red_flags(fund, r["df_last_close"])
-
-            # Context score
-            cscore = 0
-            if r["relative_strength"]:
-                rs, _, _ = r["relative_strength"]
-                if rs > 5:
-                    cscore += 5
-                elif rs > 0:
-                    cscore += 3
-
-            composite = round(r["technical_score"] * 0.60 + fscore * 0.30 + cscore * 0.10, 1)
-
+            composite = round(r["technical_score"] * 0.5 + stscore * 0.5, 1)
             r.update({
                 "fundamentals": fund,
-                "fundamental_score": fscore,
-                "fundamental_reasons": freasons,
-                "red_flags": red_flags,
-                "composite_score": composite,
-                "context_score": cscore,
-            })
-            final_results.append(r)
-            progress2.progress((i + 1) / len(shortlist))
-        progress2.empty()
-
-        # Sector filter
-        if sector_filter:
-            final_results = [r for r in final_results if r["fundamentals"] and r["fundamentals"].get("sector") in sector_filter]
-
-        top = sorted(final_results, key=lambda r: r["composite_score"], reverse=True)[:top_n]
-
-        # Store in session_state so results survive reruns until Clear is clicked
-        st.session_state.auto_scan_result = {
-            "top": top,
-            "market_status": market_status,
-            "market_note": market_note,
-        }
-
-    # Render from session_state (persists across reruns e.g. position-sizing widget interactions)
-    saved = st.session_state.auto_scan_result
-    if saved:
-        top = saved["top"]
-
-        if top:
-            pdf_bytes = generate_pdf_report(top, saved["market_status"], saved["market_note"], mode_label="Auto Scan")
-            st.download_button("📥 PDF Report Download karo", pdf_bytes, "swing_screener_report.pdf", "application/pdf")
-
-        st.subheader(f"🏆 Top {len(top)} Swing Trade Candidates")
-
-        for rank, r in enumerate(top, start=1):
-            with st.container(border=True):
-                fund = r["fundamentals"] or {}
-                col_main, col_score = st.columns([3, 1])
-                col_main.markdown(f"### #{rank} · {r['symbol']}  <span style='font-size:0.7em;color:gray'>{fund.get('sector','')}</span>", unsafe_allow_html=True)
-                col_score.metric("Composite Score", f"{r['composite_score']}/100")
-                col_score.caption(f"Tech: {r['technical_score']} | Fund: {r['fundamental_score']} | Ctx: {r['context_score']}")
-
-                # Setup tags
-                setup_html = " ".join([f"<span style='background:#e3f2fd;padding:3px 8px;border-radius:10px;margin-right:5px;font-size:0.8em'>{s}</span>" for s in r["setups"]])
-                st.markdown(f"**Setup:** {setup_html}", unsafe_allow_html=True)
-
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Last Close", f"₹{r['df_last_close']}")
-                c2.metric("RSI", r["rsi14"])
-                c3.metric("ADX", r["adx14"] or "N/A")
-                c4.metric("Weekly", "✅" if r["weekly_ok"] else "❌")
-                c5.metric("Monthly", "✅" if r["monthly_ok"] else "❌")
-
-                bt = r["breakout"]
-                st.write(f"**Breakout:** {STATUS_MAP.get(bt['status'], bt['status'])} | Resistance: ₹{bt.get('resistance')} | Support: ₹{bt.get('support')}")
-
-                rr = r["risk_reward"]
-                if rr:
-                    st.write(f"**Risk-Reward:** Entry ₹{rr['entry']} | SL ₹{rr['stop_loss']} | Target ₹{rr['target']} | R:R 1:{rr['r_r']} | ATR: {rr['atr_pct']}%")
-
-                if r["relative_strength"]:
-                    rs, sret, bret = r["relative_strength"]
-                    color = "green" if rs > 0 else "red"
-                    st.write(f"**vs Nifty (60d):** <span style='color:{color};font-weight:bold'>{rs:+.1f}%</span> (Stock: {sret:+.1f}% | Nifty: {bret:+.1f}%)", unsafe_allow_html=True)
-
-                # Expanders
-                with st.expander("📊 Technical Reasons"):
-                    for reason in r["technical_reasons"]:
-                        st.write(f"- {reason}")
-                    if r["patterns"]:
-                        st.write(f"- **Patterns:** {', '.join(r['patterns'])}")
-                    if r["divergence"]:
-                        st.write(f"- **Divergence:** {r['divergence']}")
-                    if r["gap"]:
-                        st.write(f"- **Gap:** {r['gap']}")
-
-                with st.expander("🏛️ Fundamentals"):
-                    if fund:
-                        fcols = st.columns(3)
-                        fcols[0].write(f"**P/E:** {fund.get('pe_ratio')} | **Forward P/E:** {fund.get('forward_pe')}")
-                        fcols[0].write(f"**P/B:** {fund.get('pb_ratio')} | **PEG:** {fund.get('peg_ratio')}")
-                        fcols[1].write(f"**ROE:** {fund.get('roe')}% | **ROA:** {fund.get('roa')}%")
-                        fcols[1].write(f"**Margin:** {fund.get('profit_margin')}% | **Op Margin:** {fund.get('operating_margin')}%")
-                        fcols[2].write(f"**D/E:** {fund.get('debt_to_equity')} | **Current Ratio:** {fund.get('current_ratio')}")
-                        fcols[2].write(f"**Beta:** {fund.get('beta')} | **Div Yield:** {fund.get('dividend_yield')}%")
-                        st.write(f"**Growth:** Revenue {fund.get('revenue_growth')}% | Qtr Earnings {fund.get('earnings_qtr_growth')}%")
-                        st.write(f"**Cash Flow:** FCF ₹{fund.get('free_cashflow')} | OCF ₹{fund.get('operating_cashflow')}")
-                        st.write(f"**Ownership:** Institutions {fund.get('institutional_pct')}% | Insiders {fund.get('insider_pct')}%")
-                        st.write(f"**Analyst Rating:** {fund.get('analyst_rating')}/5 ({fund.get('num_analysts')} analysts)")
-                        st.write(f"**52W Range:** ₹{fund.get('fifty_two_week_low')} - ₹{fund.get('fifty_two_week_high')}")
-                        st.write("**Score reasons:**")
-                        for freason in r["fundamental_reasons"]:
-                            st.write(f"- {freason}")
-                    else:
-                        st.write("Fundamental data nahi mila.")
-
-                with st.expander("🚩 Red Flags"):
-                    for flag in r["red_flags"]:
-                        st.write(flag)
-
-                with st.expander("📈 Chart"):
-                    fig = generate_chart(r["raw_df"], r["symbol"], bt, rr)
-                    st.plotly_chart(fig, use_container_width=True, key=f"chart_{r['symbol']}_{rank}")
-
-                # Position sizing calculator
-                with st.expander("🧮 Position Sizing Calculator"):
-                    portfolio = st.number_input(f"Portfolio Size (₹) — {r['symbol']}", min_value=10000, value=500000, step=50000, key=f"port_{r['symbol']}_{rank}")
-                    risk_pct = st.slider(f"Risk % per trade — {r['symbol']}", 0.5, 5.0, 1.0, 0.5, key=f"risk_{r['symbol']}_{rank}")
-                    if rr:
-                        max_risk = portfolio * risk_pct / 100
-                        qty = int(max_risk / rr["risk"]) if rr["risk"] > 0 else 0
-                        investment = qty * rr["entry"]
-                        st.success(f"**Qty:** {qty} shares | **Investment:** ₹{investment:,.0f} | **Max Risk:** ₹{max_risk:,.0f}")
-
-        st.caption("📌 Upcoming results/corporate actions khud check kar lo — ye tool sudden news predict nahi karta.")
-
-else:
-    st.info("Apni list paste karne ke liye niche symbols enter karo (comma separated):")
-    custom_input = st.text_area("Symbols", "RELIANCE, TCS, INFY, HDFCBANK")
-
-    btn_col1, btn_col2 = st.columns([1, 1])
-    custom_scan_clicked = btn_col1.button("Custom List Scan Karo", type="primary")
-    custom_clear_clicked = btn_col2.button("🗑️ Clear Results", key="clear_custom", disabled=st.session_state.custom_scan_result is None)
-
-    if custom_clear_clicked:
-        st.session_state.custom_scan_result = None
-        st.rerun()
-
-    if custom_scan_clicked:
-        custom_symbols = [s.strip().upper() for s in custom_input.split(",") if s.strip()]
-        progress = st.progress(0.0, text="Scanning custom list...")
-        stage1 = batch_technical_scan(custom_symbols, progress, nifty_df=nifty_df)
-        progress.empty()
-
-        if not stage1:
-            st.error("Koi stock criteria pass nahi kiya.")
-            st.stop()
-
-        shortlist = sorted(stage1, key=lambda r: r["technical_score"], reverse=True)
-        for r in shortlist:
-            fund = fetch_fundamentals(r["symbol"])
-            fscore, freasons = fundamental_score(fund)
-            red_flags = check_red_flags(fund, r["df_last_close"])
-            composite = round(r["technical_score"] * 0.6 + fscore * 0.3, 1)
-            r.update({
-                "fundamentals": fund,
-                "fundamental_score": fscore,
-                "fundamental_reasons": freasons,
+                "fundamental_score": stscore,
+                "fundamental_reasons": streasons,
+                "st_checks": stchecks,
                 "red_flags": red_flags,
                 "composite_score": composite,
                 "context_score": 0,
             })
+            final_results.append(r)
+        return final_results
 
-        st.session_state.custom_scan_result = {
-            "shortlist": shortlist,
-            "market_status": market_status,
-            "market_note": market_note,
-        }
+    def _render_short_term_card(r, rank, key_prefix):
+        fund = r["fundamentals"] or {}
+        with st.container(border=True):
+            col_main, col_score = st.columns([3, 1])
+            col_main.markdown(
+                f"### #{rank} · {r['symbol']}  <span style='font-size:0.7em;color:gray'>{fund.get('sector','')}</span>",
+                unsafe_allow_html=True,
+            )
+            col_score.metric("Composite Score", f"{r['composite_score']}/100")
+            col_score.caption(f"Tech: {r['technical_score']} | Fund Checklist: {r['fundamental_score']}%")
 
-    saved_custom = st.session_state.custom_scan_result
-    if saved_custom:
-        shortlist = saved_custom["shortlist"]
+            setup_html = " ".join(
+                [f"<span style='background:#fff3e0;padding:3px 8px;border-radius:10px;margin-right:5px;font-size:0.8em'>{s}</span>" for s in r["setups"]]
+            )
+            st.markdown(f"**Setup:** {setup_html}", unsafe_allow_html=True)
 
-        if shortlist:
-            pdf_bytes = generate_pdf_report(shortlist, saved_custom["market_status"], saved_custom["market_note"], mode_label="Custom List Scan")
-            st.download_button("📥 PDF Report Download karo", pdf_bytes, "swing_screener_report.pdf", "application/pdf", key="pdf_custom")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Last Close", f"₹{r['df_last_close']}")
+            c2.metric("RSI", r["rsi14"])
+            c3.metric("ADX", r["adx14"] or "N/A")
 
-        for rank, r in enumerate(shortlist, start=1):
-            with st.container(border=True):
-                fund = r["fundamentals"] or {}
-                col_main, col_score = st.columns([3, 1])
-                col_main.markdown(f"### #{rank} · {r['symbol']}  <span style='font-size:0.7em;color:gray'>{fund.get('sector','')}</span>", unsafe_allow_html=True)
-                col_score.metric("Composite Score", f"{r['composite_score']}/100")
-                col_score.caption(f"Tech: {r['technical_score']} | Fund: {r['fundamental_score']}")
+            bt = r["breakout"]
+            st.write(f"**Breakout:** {STATUS_MAP.get(bt['status'], bt['status'])} | Resistance: ₹{bt.get('resistance')} | Support: ₹{bt.get('support')}")
 
-                setup_html = " ".join([f"<span style='background:#e3f2fd;padding:3px 8px;border-radius:10px;margin-right:5px;font-size:0.8em'>{s}</span>" for s in r["setups"]])
-                st.markdown(f"**Setup:** {setup_html}", unsafe_allow_html=True)
+            rr = r["risk_reward"]
+            if rr:
+                st.write(f"**Risk-Reward:** Entry ₹{rr['entry']} | SL ₹{rr['stop_loss']} | Target ₹{rr['target']} | R:R 1:{rr['r_r']} | ATR: {rr['atr_pct']}%")
 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Last Close", f"₹{r['df_last_close']}")
-                c2.metric("RSI", r["rsi14"])
-                c3.metric("ADX", r["adx14"] or "N/A")
+            with st.expander("📊 Technical Reasons"):
+                for reason in r["technical_reasons"]:
+                    st.write(f"- {reason}")
+                if r["patterns"]:
+                    st.write(f"- **Patterns:** {', '.join(r['patterns'])}")
 
-                bt = r["breakout"]
-                st.write(f"**Breakout:** {STATUS_MAP.get(bt['status'], bt['status'])} | Resistance: ₹{bt.get('resistance')} | Support: ₹{bt.get('support')}")
+            with st.expander("🏛️ Short-Term Fundamental Checklist (QoQ + YoY)", expanded=True):
+                stchecks = r.get("st_checks", {"qoq": {}, "yoy": {}})
+                colq, coly = st.columns(2)
+                colq.markdown("**Quarter on Quarter (QoQ)**")
+                for k, v in stchecks.get("qoq", {}).items():
+                    icon = "✅" if v else ("❌" if v is False else "❓")
+                    colq.write(f"{icon} {k}")
+                coly.markdown("**Year on Year (YoY)**")
+                for k, v in stchecks.get("yoy", {}).items():
+                    icon = "✅" if v else ("❌" if v is False else "❓")
+                    coly.write(f"{icon} {k}")
 
-                rr = r["risk_reward"]
+            with st.expander("🚩 Red Flags"):
+                for flag in r["red_flags"]:
+                    st.write(flag)
+
+            with st.expander("📈 Chart"):
+                fig = generate_chart(r["raw_df"], r["symbol"], bt, rr)
+                st.plotly_chart(fig, use_container_width=True, key=f"chart_{key_prefix}_{r['symbol']}_{rank}")
+
+            with st.expander("🧮 Position Sizing Calculator"):
+                portfolio = st.number_input(f"Portfolio Size (₹) — {r['symbol']}", min_value=10000, value=500000, step=50000, key=f"port_{key_prefix}_{r['symbol']}_{rank}")
+                risk_pct = st.slider(f"Risk % per trade — {r['symbol']}", 0.5, 5.0, 1.0, 0.5, key=f"risk_{key_prefix}_{r['symbol']}_{rank}")
                 if rr:
-                    st.write(f"**Risk-Reward:** Entry ₹{rr['entry']} | SL ₹{rr['stop_loss']} | Target ₹{rr['target']} | R:R 1:{rr['r_r']} | ATR: {rr['atr_pct']}%")
+                    max_risk = portfolio * risk_pct / 100
+                    qty = int(max_risk / rr["risk"]) if rr["risk"] > 0 else 0
+                    investment = qty * rr["entry"]
+                    st.success(f"**Qty:** {qty} shares | **Investment:** ₹{investment:,.0f} | **Max Risk:** ₹{max_risk:,.0f}")
 
-                with st.expander("📊 Technical Reasons"):
-                    for reason in r["technical_reasons"]:
-                        st.write(f"- {reason}")
-                    if r["patterns"]:
-                        st.write(f"- **Patterns:** {', '.join(r['patterns'])}")
-                    if r["divergence"]:
-                        st.write(f"- **Divergence:** {r['divergence']}")
-                    if r["gap"]:
-                        st.write(f"- **Gap:** {r['gap']}")
+    short_mode = st.radio(
+        "Mode choose karo", ["🔍 Auto scan (NSE se khud dhundo)", "📋 Apni list paste karo"],
+        horizontal=True, key="short_mode_radio",
+    )
 
-                with st.expander("🏛️ Fundamentals"):
-                    if fund:
-                        fcols = st.columns(3)
-                        fcols[0].write(f"**P/E:** {fund.get('pe_ratio')} | **Forward P/E:** {fund.get('forward_pe')}")
-                        fcols[0].write(f"**P/B:** {fund.get('pb_ratio')} | **PEG:** {fund.get('peg_ratio')}")
-                        fcols[1].write(f"**ROE:** {fund.get('roe')}% | **ROA:** {fund.get('roa')}%")
-                        fcols[1].write(f"**Margin:** {fund.get('profit_margin')}% | **Op Margin:** {fund.get('operating_margin')}%")
-                        fcols[2].write(f"**D/E:** {fund.get('debt_to_equity')} | **Current Ratio:** {fund.get('current_ratio')}")
-                        fcols[2].write(f"**Beta:** {fund.get('beta')} | **Div Yield:** {fund.get('dividend_yield')}%")
-                        st.write("**Score reasons:**")
-                        for freason in r["fundamental_reasons"]:
-                            st.write(f"- {freason}")
-                    else:
-                        st.write("Fundamental data nahi mila.")
+    if short_mode.startswith("🔍"):
+        st_universe_choice = st.selectbox("Universe", list(INDEX_URLS.keys()), index=1, key="short_universe")
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        st_min_price = sc1.number_input("Min price (₹)", value=20, min_value=1, key="short_min_price")
+        st_min_volume = sc2.number_input("Min avg volume", value=50000, min_value=0, step=10000, key="short_min_vol")
+        st_top_n = sc3.slider("Top candidates", 1, 15, 5, key="short_top_n")
+        st_min_tech_score = sc4.slider("Min Technical Score", 0, 70, 25, key="short_min_tech")
 
-                with st.expander("🚩 Red Flags"):
-                    for flag in r["red_flags"]:
-                        st.write(flag)
+        st_min_fund_pct = st.slider(
+            "Min Fundamental Checklist Pass %", 0, 100, 60, key="short_min_fund",
+            help="QoQ + YoY checklist me kitne % criteria pass hone chahiye (jinke liye data available hai)"
+        )
 
-                with st.expander("📈 Chart"):
-                    fig = generate_chart(r["raw_df"], r["symbol"], bt, rr)
-                    st.plotly_chart(fig, use_container_width=True, key=f"chart_custom_{r['symbol']}_{rank}")
+        st_sector_filter = st.multiselect("Sector filter (optional)", [
+            "Technology", "Financial Services", "Consumer Cyclical", "Healthcare",
+            "Industrials", "Consumer Defensive", "Energy", "Basic Materials",
+            "Real Estate", "Communication Services", "Utilities"
+        ], key="short_sector_filter")
 
-                with st.expander("🧮 Position Sizing Calculator"):
-                    portfolio = st.number_input(f"Portfolio Size (₹) — {r['symbol']}", min_value=10000, value=500000, step=50000, key=f"cport_{r['symbol']}_{rank}")
-                    risk_pct = st.slider(f"Risk % per trade — {r['symbol']}", 0.5, 5.0, 1.0, 0.5, key=f"crisk_{r['symbol']}_{rank}")
-                    if rr:
-                        max_risk = portfolio * risk_pct / 100
-                        qty = int(max_risk / rr["risk"]) if rr["risk"] > 0 else 0
-                        investment = qty * rr["entry"]
-                        st.success(f"**Qty:** {qty} shares | **Investment:** ₹{investment:,.0f} | **Max Risk:** ₹{max_risk:,.0f}")
+        sbtn1, sbtn2 = st.columns([1, 1])
+        short_scan_clicked = sbtn1.button("🚀 Scan Shuru Karo", type="primary", key="short_scan_btn")
+        short_clear_clicked = sbtn2.button("🗑️ Clear Results", key="short_clear_btn", disabled=st.session_state.short_auto_scan_result is None)
+
+        if short_clear_clicked:
+            st.session_state.short_auto_scan_result = None
+            st.rerun()
+
+        if short_scan_clicked:
+            symbols = get_universe(st_universe_choice)
+            if not symbols:
+                st.stop()
+
+            st.write(f"**{len(symbols)} stocks** scan honge. Bade universe me time lagega ⏳")
+            progress = st.progress(0.0, text="Stage 1: Technical scan chal raha hai...")
+            stage1 = batch_technical_scan(symbols, progress, min_price=st_min_price, min_avg_volume=st_min_volume, nifty_df=nifty_df)
+            progress.empty()
+
+            stage1 = [r for r in stage1 if r["technical_score"] >= st_min_tech_score]
+            if not stage1:
+                st.error("Koi stock minimum technical score pass nahi kar paya. Filters loosen karo.")
+                st.stop()
+
+            stage1_sorted = sorted(stage1, key=lambda r: r["technical_score"], reverse=True)
+            shortlist = stage1_sorted[:max(25, st_top_n * 5)]
+
+            st.write(f"Stage 1 se **{len(shortlist)}** technically strong stocks shortlist hue. Ab short-term fundamental checklist check ho raha hai...")
+            final_results = _score_short_term_batch(shortlist)
+
+            if st_sector_filter:
+                final_results = [r for r in final_results if r["fundamentals"] and r["fundamentals"].get("sector") in st_sector_filter]
+
+            final_results = [r for r in final_results if r["fundamental_score"] >= st_min_fund_pct]
+
+            top = sorted(final_results, key=lambda r: r["composite_score"], reverse=True)[:st_top_n]
+
+            st.session_state.short_auto_scan_result = {
+                "top": top,
+                "market_status": market_status,
+                "market_note": market_note,
+            }
+
+        saved = st.session_state.short_auto_scan_result
+        if saved:
+            top = saved["top"]
+            if not top:
+                st.error("Koi stock filters pass nahi kar paya. Min Fundamental % ya Min Technical Score kam karo.")
+            else:
+                pdf_bytes = generate_pdf_report(top, saved["market_status"], saved["market_note"], mode_label="Short Term Scan")
+                st.download_button("📥 PDF Report Download karo", pdf_bytes, "short_term_screener_report.pdf", "application/pdf", key="pdf_short_auto")
+
+                st.subheader(f"🏆 Top {len(top)} Short Term Candidates")
+                for rank, r in enumerate(top, start=1):
+                    _render_short_term_card(r, rank, key_prefix="short_auto")
+
+        st.caption("📌 Upcoming results/corporate actions khud check kar lo — ye tool sudden news predict nahi karta.")
+
+    else:
+        st.info("Apni list paste karne ke liye niche symbols enter karo (comma separated):")
+        st_custom_input = st.text_area("Symbols", "RELIANCE, TCS, INFY, HDFCBANK", key="short_custom_input")
+
+        st_min_fund_pct_c = st.slider(
+            "Min Fundamental Checklist Pass %", 0, 100, 0, key="short_min_fund_custom",
+            help="Custom list me default 0 rakha hai taaki tumhare diye stocks filter na ho jaayein"
+        )
+
+        cbtn1, cbtn2 = st.columns([1, 1])
+        short_custom_scan_clicked = cbtn1.button("Custom List Scan Karo", type="primary", key="short_custom_scan_btn")
+        short_custom_clear_clicked = cbtn2.button("🗑️ Clear Results", key="short_clear_custom", disabled=st.session_state.short_custom_scan_result is None)
+
+        if short_custom_clear_clicked:
+            st.session_state.short_custom_scan_result = None
+            st.rerun()
+
+        if short_custom_scan_clicked:
+            custom_symbols = [s.strip().upper() for s in st_custom_input.split(",") if s.strip()]
+            progress = st.progress(0.0, text="Scanning custom list...")
+            stage1 = batch_technical_scan(custom_symbols, progress, nifty_df=nifty_df)
+            progress.empty()
+
+            if not stage1:
+                st.error("Koi stock criteria pass nahi kiya.")
+                st.stop()
+
+            shortlist = sorted(stage1, key=lambda r: r["technical_score"], reverse=True)
+            final_results = _score_short_term_batch(shortlist)
+            final_results = [r for r in final_results if r["fundamental_score"] >= st_min_fund_pct_c]
+
+            st.session_state.short_custom_scan_result = {
+                "shortlist": final_results,
+                "market_status": market_status,
+                "market_note": market_note,
+            }
+
+        saved_custom = st.session_state.short_custom_scan_result
+        if saved_custom:
+            shortlist = saved_custom["shortlist"]
+            if not shortlist:
+                st.error("Koi stock filters pass nahi kar paya.")
+            else:
+                pdf_bytes = generate_pdf_report(shortlist, saved_custom["market_status"], saved_custom["market_note"], mode_label="Short Term Custom Scan")
+                st.download_button("📥 PDF Report Download karo", pdf_bytes, "short_term_screener_report.pdf", "application/pdf", key="pdf_short_custom")
+
+                for rank, r in enumerate(shortlist, start=1):
+                    _render_short_term_card(r, rank, key_prefix="short_custom")
