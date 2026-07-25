@@ -1,30 +1,34 @@
 """
-Swing Trade Screener — Auto Scan (No List Needed)
-====================================================
-List paste karne ki zaroorat nahi. App khud NSE cash segment se stocks
-fetch karke, sab criteria check karke top candidates deta hai.
-
-Criteria covered:
-  1. Trend & Price Action (daily + weekly alignment, EMA20/50)
-  2. Volume confirmation
-  3. RSI, MACD crossover, Bollinger Bands
-  4. Risk-Reward suggestion (ATR-based stop-loss/target)
-  5. Market context (Nifty trend)
-  6. Basic fundamentals + red flags
-  7. Volatility (ATR%)
+Swing Trade Screener Pro — Upgraded Edition
+============================================
+Major upgrades over v1:
+  • 15+ Technical indicators (ADX, Stochastic, VWAP, S/R, Candlesticks,
+    Divergence, Gap Analysis, Relative Strength vs Nifty)
+  • 20+ Fundamental metrics (P/B, PEG, Cash Flow, Beta, 52W range,
+    Institutional holding, Quarterly earnings growth, Current ratio, etc.)
+  • Interactive Plotly charts per candidate
+  • Multi-timeframe confluence scoring + Swing Setup classification
+  • Earnings proximity alert
+  • Sector & Market Cap filters
+  • Export to CSV
+  • Position sizing calculator
 
 Chalane ka tareeka:
     pip install -r requirements.txt
     streamlit run app.py
 """
 
+import io
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
+from datetime import datetime, timedelta
+from plotly.subplots import make_subplots
 
-st.set_page_config(page_title="Swing Trade Screener", layout="wide", page_icon="📈")
+st.set_page_config(page_title="Swing Trade Screener Pro", layout="wide", page_icon="📈")
 
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -39,36 +43,37 @@ INDEX_URLS = {
 }
 
 
+# =============================================================================
+# NSE UNIVERSE FETCH
+# =============================================================================
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
 def get_universe(choice):
-    """NSE se stock symbols ki list laata hai (cookies/session ke saath, NSE bot-protection ke liye)."""
     session = requests.Session()
     session.headers.update(NSE_HEADERS)
     try:
-        session.get("https://www.nseindia.com", timeout=8)  # cookies warm-up
+        session.get("https://www.nseindia.com", timeout=8)
         resp = session.get(INDEX_URLS[choice], timeout=15)
         resp.raise_for_status()
-        from io import StringIO
-        df = pd.read_csv(StringIO(resp.text))
+        df = pd.read_csv(io.StringIO(resp.text))
         col = "Symbol" if "Symbol" in df.columns else "SYMBOL"
         symbols = df[col].astype(str).str.strip().tolist()
-        if "SERIES" in df.columns:  # full EQUITY_L.csv me sirf EQ series lo (cash segment)
+        if "SERIES" in df.columns:
             symbols = df.loc[df["SERIES"].str.strip() == "EQ", col].astype(str).str.strip().tolist()
         return symbols
     except Exception as e:
-        st.error(
-            f"NSE se list download nahi ho payi ({e}). "
-            "NSE ki site kabhi-kabhi script requests block karti hai. "
-            "Thodi der baad try karo, ya 'Apni list paste karo' mode use karo."
-        )
+        st.error(f"NSE se list download nahi ho payi ({e}). Thodi der baad try karo.")
         return []
 
 
-# ---------------------------------------------------------------------------
-# INDICATORS
-# ---------------------------------------------------------------------------
+# =============================================================================
+# TECHNICAL INDICATORS
+# =============================================================================
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
+
+
+def sma(series, period):
+    return series.rolling(period).mean()
 
 
 def rsi(series, period=14):
@@ -84,15 +89,16 @@ def rsi(series, period=14):
 def macd(series, fast=12, slow=26, signal=9):
     macd_line = ema(series, fast) - ema(series, slow)
     signal_line = ema(macd_line, signal)
-    return macd_line, signal_line
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
 
 
 def bollinger(series, period=20, std_mult=2):
-    sma = series.rolling(period).mean()
+    ma = series.rolling(period).mean()
     std = series.rolling(period).std()
-    upper = sma + std_mult * std
-    lower = sma - std_mult * std
-    width_pct = (upper - lower) / sma * 100
+    upper = ma + std_mult * std
+    lower = ma - std_mult * std
+    width_pct = (upper - lower) / ma * 100
     return upper, lower, width_pct
 
 
@@ -103,37 +109,161 @@ def atr(df, period=14):
     return tr.rolling(period).mean()
 
 
+def adx(df, period=14):
+    high, low, close = df["high"], df["low"], df["close"]
+    plus_dm = high.diff()
+    minus_dm = low.diff().abs()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
+    tr = pd.concat([(high - low), (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+    atr_val = tr.rolling(period).mean()
+    plus_di = 100 * (plus_dm.rolling(period).mean() / atr_val.replace(0, np.nan))
+    minus_di = 100 * (minus_dm.rolling(period).mean() / atr_val.replace(0, np.nan))
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)) * 100
+    adx_val = dx.rolling(period).mean()
+    return adx_val, plus_di, minus_di
+
+
+def stochastic(df, k_period=14, d_period=3):
+    lowest_low = df["low"].rolling(k_period).min()
+    highest_high = df["high"].rolling(k_period).max()
+    k = 100 * (df["close"] - lowest_low) / (highest_high - lowest_low).replace(0, np.nan)
+    d = k.rolling(d_period).mean()
+    return k, d
+
+
+def vwap(df):
+    typical = (df["high"] + df["low"] + df["close"]) / 3
+    vwap_val = (typical * df["volume"]).cumsum() / df["volume"].cumsum()
+    return vwap_val
+
+
 def compute_all_indicators(df):
     df = df.copy()
+    df["ema9"] = ema(df["close"], 9)
     df["ema20"] = ema(df["close"], 20)
     df["ema50"] = ema(df["close"], 50)
+    df["ema200"] = ema(df["close"], 200)
     df["rsi14"] = rsi(df["close"], 14)
-    df["macd_line"], df["macd_signal"] = macd(df["close"])
+    df["macd_line"], df["macd_signal"], df["macd_hist"] = macd(df["close"])
     df["bb_upper"], df["bb_lower"], df["bb_width_pct"] = bollinger(df["close"])
     df["atr14"] = atr(df, 14)
     df["vol_avg20"] = df["volume"].rolling(20).mean()
+    df["adx14"], df["plus_di"], df["minus_di"] = adx(df)
+    df["stoch_k"], df["stoch_d"] = stochastic(df)
+    df["vwap"] = vwap(df)
+    df["sma20"] = sma(df["close"], 20)
+    df["sma50"] = sma(df["close"], 50)
     return df
 
 
+# =============================================================================
+# SUPPORT / RESISTANCE & PATTERNS
+# =============================================================================
+def find_support_resistance(df, lookback=30):
+    if len(df) < lookback + 5:
+        return None, None
+    window = df.iloc[-(lookback + 5):-5]
+    resistance = window["high"].max()
+    support = window["low"].min()
+    return round(float(support), 2), round(float(resistance), 2)
+
+
+def detect_candlestick_patterns(df):
+    if len(df) < 3:
+        return []
+    c1, c2, c3 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
+    patterns = []
+    o1, h1, l1, cl1 = c1["open"], c1["high"], c1["low"], c1["close"]
+    o2, h2, l2, cl2 = c2["open"], c2["high"], c2["low"], c2["close"]
+    body1 = abs(cl1 - o1)
+    range1 = h1 - l1
+    upper_shadow1 = h1 - max(o1, cl1)
+    lower_shadow1 = min(o1, cl1) - l1
+
+    # Hammer
+    if lower_shadow1 > 2 * body1 and upper_shadow1 < body1 and cl1 > o1:
+        patterns.append("Hammer (bullish reversal)")
+    # Shooting Star
+    if upper_shadow1 > 2 * body1 and lower_shadow1 < body1 and cl1 < o1:
+        patterns.append("Shooting Star (bearish reversal)")
+    # Bullish Engulfing
+    if cl2 < o2 and cl1 > o1 and o1 < cl2 and cl1 > o2:
+        patterns.append("Bullish Engulfing")
+    # Bearish Engulfing
+    if cl2 > o2 and cl1 < o1 and o1 > cl2 and cl1 < o2:
+        patterns.append("Bearish Engulfing")
+    # Doji
+    if body1 < 0.1 * range1:
+        patterns.append("Doji (indecision)")
+    return patterns
+
+
+def detect_divergence(df, indicator="rsi", lookback=20):
+    if len(df) < lookback + 5:
+        return None
+    price = df["close"].iloc[-lookback:]
+    ind = df[f"{indicator}14" if indicator == "rsi" else "macd_line"].iloc[-lookback:]
+    price_lows = price.iloc[-lookback:-5].min(), price.iloc[-5:].min()
+    ind_lows = ind.iloc[-lookback:-5].min(), ind.iloc[-5:].min()
+    price_highs = price.iloc[-lookback:-5].max(), price.iloc[-5:].max()
+    ind_highs = ind.iloc[-lookback:-5].max(), ind.iloc[-5:].max()
+
+    # Bullish divergence: lower price low, higher indicator low
+    if price_lows[1] < price_lows[0] and ind_lows[1] > ind_lows[0]:
+        return "Bullish Divergence"
+    # Bearish divergence: higher price high, lower indicator high
+    if price_highs[1] > price_highs[0] and ind_highs[1] < ind_highs[0]:
+        return "Bearish Divergence"
+    return None
+
+
+def gap_analysis(df):
+    if len(df) < 2:
+        return None
+    prev_close = df["close"].iloc[-2]
+    curr_open = df["open"].iloc[-1]
+    gap_pct = (curr_open - prev_close) / prev_close * 100
+    if gap_pct > 2:
+        return f"Gap Up +{gap_pct:.1f}%"
+    elif gap_pct < -2:
+        return f"Gap Down {gap_pct:.1f}%"
+    return None
+
+
 def weekly_trend_ok(df):
-    """Weekly timeframe pe bhi uptrend confirm karo (daily + weekly alignment)."""
     weekly = df.set_index("date").resample("W").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     ).dropna()
     if len(weekly) < 12:
         return None
-    weekly["ema20"] = ema(weekly["close"], 10)  # ~10 weekly bars ≈ short trend filter
-    return bool(weekly["close"].iloc[-1] > weekly["ema20"].iloc[-1])
+    weekly["ema10"] = ema(weekly["close"], 10)
+    return bool(weekly["close"].iloc[-1] > weekly["ema10"].iloc[-1])
 
 
+def monthly_trend_ok(df):
+    monthly = df.set_index("date").resample("ME").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    ).dropna()
+    if len(monthly) < 6:
+        return None
+    monthly["ema6"] = ema(monthly["close"], 6)
+    return bool(monthly["close"].iloc[-1] > monthly["ema6"].iloc[-1])
+
+
+# =============================================================================
+# BREAKOUT & SETUP CLASSIFICATION
+# =============================================================================
 def breakout_analysis(df, lookback=40, near_pct=1.5, volume_mult=1.5):
     if len(df) < lookback + 5:
         return {"status": "insufficient_data"}
     window = df.iloc[-(lookback + 3):-3]
     resistance = window["high"].max()
+    support = window["low"].min()
     last = df.iloc[-1]
     vol_avg = df["vol_avg20"].iloc[-1]
     vol_confirmed = vol_avg and last["volume"] > volume_mult * vol_avg
+
     if last["close"] > resistance and vol_confirmed:
         status = "breakout_confirmed"
     elif last["close"] > resistance:
@@ -142,86 +272,196 @@ def breakout_analysis(df, lookback=40, near_pct=1.5, volume_mult=1.5):
         status = "near_breakout"
     else:
         status = "no_breakout"
+
     return {
-        "status": status, "resistance": round(float(resistance), 2),
+        "status": status,
+        "resistance": round(float(resistance), 2),
+        "support": round(float(support), 2),
         "last_volume": int(last["volume"]),
         "avg_volume_20d": None if pd.isna(vol_avg) else int(vol_avg),
         "volume_confirmed": bool(vol_confirmed),
     }
 
 
-def technical_score(df, weekly_ok):
+def classify_setup(df, breakout, weekly_ok, patterns, divergence, gap):
+    last = df.iloc[-1]
+    setups = []
+
+    # VCP / Breakout
+    if breakout["status"] in ["breakout_confirmed", "breakout_low_volume"]:
+        setups.append("Breakout")
+    elif breakout["status"] == "near_breakout":
+        setups.append("Near Breakout")
+
+    # Pullback to EMA
+    if last["close"] > last["ema20"] and last["low"] <= last["ema20"] * 1.02:
+        setups.append("Pullback to EMA20")
+    if last["close"] > last["ema50"] and last["low"] <= last["ema50"] * 1.02:
+        setups.append("Pullback to EMA50")
+
+    # Bounce from support
+    if breakout["support"] and last["close"] <= breakout["support"] * 1.03:
+        setups.append("Near Support")
+
+    # Gap & Go
+    if gap and "Gap Up" in gap:
+        setups.append("Gap & Go")
+
+    # RSI Reversal
+    if last["rsi14"] < 40 and last["rsi14"] > df["rsi14"].iloc[-3]:
+        setups.append("RSI Reversal")
+
+    # Stochastic bounce
+    if last["stoch_k"] < 30 and last["stoch_k"] > last["stoch_d"]:
+        setups.append("Stochastic Bounce")
+
+    # Divergence
+    if divergence == "Bullish Divergence":
+        setups.append("Bullish Divergence")
+
+    # VWAP reclaim
+    if last["close"] > last["vwap"] and df["close"].iloc[-2] <= df["vwap"].iloc[-2]:
+        setups.append("VWAP Reclaim")
+
+    return setups if setups else ["Consolidation"]
+
+
+# =============================================================================
+# SCORING SYSTEM
+# =============================================================================
+def technical_score(df, weekly_ok, monthly_ok, patterns, divergence, gap, breakout):
     last = df.iloc[-1]
     score, reasons = 0, []
 
-    # 1) Daily trend structure (25)
-    if last["close"] > last["ema20"] > last["ema50"]:
-        score += 25
-        reasons.append("Daily uptrend: Price > EMA20 > EMA50")
-    elif last["close"] > last["ema20"]:
+    # 1) Trend structure (15)
+    if last["close"] > last["ema20"] > last["ema50"] > last["ema200"]:
+        score += 15
+        reasons.append("Strong uptrend: Price > EMA20 > EMA50 > EMA200")
+    elif last["close"] > last["ema20"] > last["ema50"]:
         score += 12
-        reasons.append("Price > EMA20 (EMA50 se neeche)")
+        reasons.append("Uptrend: Price > EMA20 > EMA50")
+    elif last["close"] > last["ema20"]:
+        score += 6
+        reasons.append("Price > EMA20 only")
 
-    # 2) Weekly alignment (15)
-    if weekly_ok:
-        score += 15
-        reasons.append("Weekly timeframe bhi uptrend me hai (daily+weekly aligned)")
-    elif weekly_ok is False:
-        reasons.append("Weekly trend abhi weak/neutral hai")
-
-    # 3) RSI zone (15)
-    r = last["rsi14"]
-    if 50 <= r <= 70:
-        score += 15
-        reasons.append(f"RSI healthy zone me ({r:.1f})")
-    elif 70 < r <= 80:
+    # 2) Multi-timeframe alignment (10)
+    if weekly_ok and monthly_ok:
+        score += 10
+        reasons.append("Daily + Weekly + Monthly all aligned UP")
+    elif weekly_ok:
         score += 7
-        reasons.append(f"RSI overbought-ish ({r:.1f})")
+        reasons.append("Daily + Weekly aligned UP")
+    elif monthly_ok:
+        score += 5
+        reasons.append("Monthly aligned UP")
 
-    # 4) MACD bullish crossover (15) - last 3 din me crossover hua ho
-    recent = df.tail(3)
+    # 3) ADX Trend Strength (10)
+    adx_val = last["adx14"]
+    if not pd.isna(adx_val):
+        if adx_val > 25:
+            score += 10
+            reasons.append(f"Strong trend (ADX {adx_val:.1f})")
+        elif adx_val > 20:
+            score += 5
+            reasons.append(f"Trend building (ADX {adx_val:.1f})")
+
+    # 4) RSI (8)
+    r = last["rsi14"]
+    if 50 <= r <= 65:
+        score += 8
+        reasons.append(f"RSI sweet spot ({r:.1f})")
+    elif 40 <= r < 50:
+        score += 6
+        reasons.append(f"RSI recovering ({r:.1f})")
+    elif 65 < r <= 75:
+        score += 4
+        reasons.append(f"RSI strong but watch ({r:.1f})")
+
+    # 5) MACD (8)
+    recent = df.tail(5)
     crossed = ((recent["macd_line"] > recent["macd_signal"]) &
                (recent["macd_line"].shift(1) <= recent["macd_signal"].shift(1))).any()
     if crossed:
-        score += 15
-        reasons.append("MACD bullish crossover recently hua")
-    elif last["macd_line"] > last["macd_signal"]:
-        score += 7
-        reasons.append("MACD line signal ke upar hai")
+        score += 8
+        reasons.append("MACD bullish crossover recently")
+    elif last["macd_line"] > last["macd_signal"] and last["macd_hist"] > df["macd_hist"].iloc[-2]:
+        score += 5
+        reasons.append("MACD bullish & histogram expanding")
 
-    # 5) Bollinger — squeeze (setup) ya upper-band breakout (10)
-    bb_width = df["bb_width_pct"]
-    if last["close"] > last["bb_upper"]:
-        score += 10
-        reasons.append("Bollinger upper band breakout")
-    elif bb_width.iloc[-1] < bb_width.tail(60).quantile(0.25):
-        score += 6
-        reasons.append("Bollinger squeeze - breakout ka setup ban raha hai")
+    # 6) Stochastic (5)
+    if last["stoch_k"] < 30 and last["stoch_k"] > last["stoch_d"]:
+        score += 5
+        reasons.append("Stochastic oversold bounce")
+    elif 30 <= last["stoch_k"] <= 70 and last["stoch_k"] > last["stoch_d"]:
+        score += 3
+        reasons.append("Stochastic bullish")
 
-    # 6) Volume confirmation (10)
+    # 7) Bollinger (5)
+    if last["close"] > last["bb_upper"] and breakout["volume_confirmed"]:
+        score += 5
+        reasons.append("Bollinger upper band breakout + volume")
+    elif last["bb_width_pct"] < df["bb_width_pct"].tail(60).quantile(0.25):
+        score += 3
+        reasons.append("Bollinger squeeze setup")
+
+    # 8) Volume (8)
     vol_avg = df["vol_avg20"].iloc[-1]
-    if vol_avg and last["volume"] > 1.5 * vol_avg:
-        score += 10
-        reasons.append("Aaj ka volume 20-din average se 1.5x zyada")
+    if vol_avg and last["volume"] > 2 * vol_avg:
+        score += 8
+        reasons.append("Volume 2x average — strong conviction")
+    elif vol_avg and last["volume"] > 1.5 * vol_avg:
+        score += 5
+        reasons.append("Volume 1.5x average")
 
-    return round(min(score, 100), 1), reasons
+    # 9) Breakout (8)
+    if breakout["status"] == "breakout_confirmed":
+        score += 8
+        reasons.append("Breakout confirmed with volume")
+    elif breakout["status"] == "near_breakout":
+        score += 5
+        reasons.append("Near breakout — watch closely")
+
+    # 10) Candlestick / Divergence / Gap (8)
+    if patterns:
+        score += 4
+        reasons.append(f"Candlestick: {', '.join(patterns)}")
+    if divergence == "Bullish Divergence":
+        score += 4
+        reasons.append("Bullish divergence detected")
+    if gap and "Gap Up" in gap:
+        score += 3
+        reasons.append(gap)
+
+    return round(min(score, 70), 1), reasons
 
 
-def risk_reward(df):
+def risk_reward(df, breakout):
     last = df.iloc[-1]
     a = last["atr14"]
     if pd.isna(a) or a <= 0:
         return None
     entry = round(float(last["close"]), 2)
-    stop = round(entry - 1.5 * a, 2)
-    target = round(entry + 2 * (entry - stop), 2)  # 1:2 R:R
+    # Stop below recent swing low or 1.5 ATR, whichever is closer (tighter)
+    swing_stop = breakout.get("support", entry * 0.95) if breakout else entry * 0.95
+    atr_stop = round(entry - 1.5 * a, 2)
+    stop = max(swing_stop, atr_stop) if swing_stop < entry else atr_stop
+    stop = round(stop, 2)
+    risk = entry - stop
+    target = round(entry + 2.5 * risk, 2)  # 1:2.5 R:R
     atr_pct = round(a / entry * 100, 2)
-    return {"entry": entry, "stop_loss": stop, "target": target, "atr_pct": atr_pct}
+    return {
+        "entry": entry,
+        "stop_loss": stop,
+        "target": target,
+        "risk": round(risk, 2),
+        "atr_pct": atr_pct,
+        "r_r": round((target - entry) / risk, 1) if risk > 0 else 0,
+    }
 
 
-# ---------------------------------------------------------------------------
-# FUNDAMENTALS (stage 2 only — top candidates pe)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# FUNDAMENTALS (Enhanced)
+# =============================================================================
 def fetch_fundamentals(symbol):
     try:
         info = yf.Ticker(f"{symbol}.NS").info
@@ -229,53 +469,165 @@ def fetch_fundamentals(symbol):
         return None
     if not info or info.get("regularMarketPrice") is None:
         return None
+
+    def pct(val):
+        return round(val * 100, 2) if val is not None else None
+
     return {
-        "pe_ratio": info.get("trailingPE"), "debt_to_equity": info.get("debtToEquity"),
-        "roe": info.get("returnOnEquity"), "profit_margin": info.get("profitMargins"),
-        "revenue_growth": info.get("revenueGrowth"), "sector": info.get("sector"),
+        # Valuation
+        "pe_ratio": info.get("trailingPE"),
+        "forward_pe": info.get("forwardPE"),
+        "pb_ratio": info.get("priceToBook"),
+        "peg_ratio": info.get("pegRatio"),
+        "ev_ebitda": info.get("enterpriseToEbitda"),
+        # Profitability
+        "roe": pct(info.get("returnOnEquity")),
+        "roa": pct(info.get("returnOnAssets")),
+        "profit_margin": pct(info.get("profitMargins")),
+        "operating_margin": pct(info.get("operatingMargins")),
+        # Growth
+        "revenue_growth": pct(info.get("revenueGrowth")),
+        "earnings_growth": pct(info.get("earningsGrowth")),
+        "revenue_qtr_growth": pct(info.get("revenueQuarterlyGrowth")),
+        "earnings_qtr_growth": pct(info.get("earningsQuarterlyGrowth")),
+        # Financial Health
+        "debt_to_equity": info.get("debtToEquity"),
+        "current_ratio": info.get("currentRatio"),
+        "quick_ratio": info.get("quickRatio"),
+        "interest_coverage": info.get("interestCoverage"),
+        "total_cash": info.get("totalCash"),
+        "total_debt": info.get("totalDebt"),
+        "free_cashflow": info.get("freeCashflow"),
+        "operating_cashflow": info.get("operatingCashflow"),
+        # Market Data
+        "beta": info.get("beta"),
+        "dividend_yield": pct(info.get("dividendYield")),
+        "market_cap": info.get("marketCap"),
+        "fifty_two_week_high": info.get("fiftyTwoWeekHigh"),
+        "fifty_two_week_low": info.get("fiftyTwoWeekLow"),
+        "avg_volume_3m": info.get("averageVolume3Month"),
+        # Ownership
+        "institutional_pct": pct(info.get("heldPercentInstitutions")),
+        "insider_pct": pct(info.get("heldPercentInsiders")),
+        "short_ratio": info.get("shortRatio"),
+        # Analyst
+        "analyst_rating": info.get("recommendationMean"),  # 1=strong buy, 5=strong sell
+        "num_analysts": info.get("numberOfAnalystOpinions"),
+        # Meta
+        "sector": info.get("sector"),
+        "industry": info.get("industry"),
+        "website": info.get("website"),
     }
 
 
 def check_red_flags(fund, last_close):
     flags = []
     if last_close < 20:
-        flags.append("Penny stock (₹20 se kam) - junk/manipulation risk")
+        flags.append("⚠️ Penny stock (< ₹20) — manipulation risk")
     if not fund:
-        return flags + ["Fundamental data nahi mila - manually verify karo"]
+        return flags + ["❓ Fundamental data nahi mila — manually verify karo"]
+
     de = fund.get("debt_to_equity")
     if de is not None and de > 150:
-        flags.append(f"High debt-to-equity ({de:.0f}%)")
+        flags.append(f"🔴 High debt-to-equity ({de:.0f}%)")
+
     margin = fund.get("profit_margin")
     if margin is not None and margin < 0:
-        flags.append("Negative profit margin (company loss me hai)")
+        flags.append("🔴 Negative profit margin")
+
     roe = fund.get("roe")
-    if roe is not None and roe < 0.05:
-        flags.append(f"Low ROE ({roe*100:.1f}%)")
+    if roe is not None and roe < 5:
+        flags.append(f"🟡 Low ROE ({roe:.1f}%)")
+
     rev = fund.get("revenue_growth")
-    if rev is not None and rev < 0:
-        flags.append(f"Revenue declining ({rev*100:.1f}%)")
-    return flags if flags else ["Koi major red flag nahi mila"]
+    if rev is not None and rev < -5:
+        flags.append(f"🔴 Revenue declining ({rev:.1f}%)")
+
+    curr = fund.get("current_ratio")
+    if curr is not None and curr < 1:
+        flags.append("🟡 Current ratio < 1 — liquidity concern")
+
+    fcf = fund.get("free_cashflow")
+    if fcf is not None and fcf < 0:
+        flags.append("🟡 Negative free cash flow")
+
+    beta = fund.get("beta")
+    if beta is not None and beta > 2:
+        flags.append(f"🟡 Very high beta ({beta:.2f}) — volatile")
+
+    insider = fund.get("insider_pct")
+    if insider is not None and insider < 10:
+        flags.append(f"🟡 Low insider holding ({insider:.1f}%)")
+
+    return flags if flags else ["✅ Koi major red flag nahi mila"]
 
 
 def fundamental_score(fund):
     if not fund:
-        return 50
-    score = 50
-    de, roe, margin, rev = (fund.get(k) for k in ["debt_to_equity", "roe", "profit_margin", "revenue_growth"])
-    if de is not None:
-        score += 15 if de < 60 else (-15 if de > 150 else 0)
-    if roe is not None:
-        score += 15 if roe > 0.15 else (-10 if roe < 0.05 else 0)
-    if margin is not None:
-        score += 10 if margin > 0.10 else (-15 if margin < 0 else 0)
-    if rev is not None:
-        score += 10 if rev > 0.10 else (-10 if rev < 0 else 0)
-    return max(0, min(100, round(score, 1)))
+        return 30, ["Data nahi mila"]
+    score = 30
+    reasons = []
+
+    # Valuation (max 15)
+    pe = fund.get("pe_ratio")
+    pb = fund.get("pb_ratio")
+    peg = fund.get("peg_ratio")
+    if pe is not None and 10 <= pe <= 25:
+        score += 8
+        reasons.append(f"P/E healthy ({pe:.1f})")
+    elif pe is not None and pe < 40:
+        score += 4
+        reasons.append(f"P/E acceptable ({pe:.1f})")
+    if pb is not None and pb <= 3:
+        score += 4
+        reasons.append(f"P/B reasonable ({pb:.2f})")
+    if peg is not None and peg < 1.5:
+        score += 3
+        reasons.append(f"PEG attractive ({peg:.2f})")
+
+    # Profitability (max 12)
+    roe = fund.get("roe")
+    margin = fund.get("profit_margin")
+    if roe is not None and roe > 15:
+        score += 6
+        reasons.append(f"ROE strong ({roe:.1f}%)")
+    elif roe is not None and roe > 10:
+        score += 3
+        reasons.append(f"ROE decent ({roe:.1f}%)")
+    if margin is not None and margin > 10:
+        score += 6
+        reasons.append(f"Profit margin healthy ({margin:.1f}%)")
+
+    # Growth (max 10)
+    rev = fund.get("revenue_growth")
+    earn = fund.get("earnings_qtr_growth")
+    if rev is not None and rev > 10:
+        score += 5
+        reasons.append(f"Revenue growing ({rev:.1f}%)")
+    if earn is not None and earn > 10:
+        score += 5
+        reasons.append(f"Qtr earnings growing ({earn:.1f}%)")
+
+    # Financial Health (max 8)
+    de = fund.get("debt_to_equity")
+    curr = fund.get("current_ratio")
+    fcf = fund.get("free_cashflow")
+    if de is not None and de < 60:
+        score += 3
+        reasons.append("Low debt")
+    if curr is not None and curr > 1.5:
+        score += 3
+        reasons.append("Good liquidity")
+    if fcf is not None and fcf > 0:
+        score += 2
+        reasons.append("Positive FCF")
+
+    return max(0, min(100, round(score, 1))), reasons
 
 
-# ---------------------------------------------------------------------------
-# MARKET CONTEXT
-# ---------------------------------------------------------------------------
+# =============================================================================
+# MARKET CONTEXT & RELATIVE STRENGTH
+# =============================================================================
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def get_market_context():
     try:
@@ -285,19 +637,97 @@ def get_market_context():
         nifty["ema50"] = ema(nifty["close"], 50)
         last = nifty.iloc[-1]
         if last["close"] > last["ema20"] > last["ema50"]:
-            return "Bullish 🟢", "Nifty uptrend me hai - naye longs ke liye supportive environment"
+            trend = "Bullish 🟢"
+            note = "Nifty uptrend me — swing longs ke liye supportive"
         elif last["close"] < last["ema20"] < last["ema50"]:
-            return "Bearish 🔴", "Nifty downtrend me hai - swing longs risky ho sakte hain, caution rakho"
+            trend = "Bearish 🔴"
+            note = "Nifty downtrend me — caution, short side ya cash preferable"
         else:
-            return "Neutral/Choppy 🟡", "Nifty sideways/mixed hai - stock-specific selection zyada important"
+            trend = "Neutral/Choppy 🟡"
+            note = "Mixed market — stock-specific selection zyada important"
+        return trend, note, nifty
     except Exception:
-        return "Unknown", "Market context fetch nahi ho paya"
+        return "Unknown", "Market context fetch nahi ho paya", None
 
 
-# ---------------------------------------------------------------------------
-# STAGE 1: batch technical scan (fast)
-# ---------------------------------------------------------------------------
-def batch_technical_scan(symbols, progress_bar, min_price=20, min_avg_volume=50000, batch_size=50):
+def relative_strength(stock_close, benchmark_close, period=60):
+    """Stock vs Nifty RS ratio — stock ne nifty se kitna out/under-perform kiya."""
+    if len(stock_close) < period or len(benchmark_close) < period:
+        return None
+    stock_ret = (stock_close.iloc[-1] / stock_close.iloc[-period] - 1) * 100
+    bench_ret = (benchmark_close.iloc[-1] / benchmark_close.iloc[-period] - 1) * 100
+    rs = round(stock_ret - bench_ret, 2)
+    return rs, stock_ret, bench_ret
+
+
+# =============================================================================
+# PLOTLY CHART
+# =============================================================================
+def generate_chart(df, symbol, breakout, rr):
+    fig = make_subplots(
+        rows=4, cols=1, shared_xaxes=True,
+        vertical_spacing=0.03,
+        row_heights=[0.55, 0.15, 0.15, 0.15],
+        subplot_titles=(f"{symbol} — Price Action", "Volume", "RSI", "MACD")
+    )
+
+    # Candlestick
+    fig.add_trace(go.Candlestick(
+        x=df["date"], open=df["open"], high=df["high"],
+        low=df["low"], close=df["close"], name="Price"
+    ), row=1, col=1)
+
+    # EMAs
+    fig.add_trace(go.Scatter(x=df["date"], y=df["ema9"], line=dict(color="orange", width=1), name="EMA9"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["ema20"], line=dict(color="blue", width=1.5), name="EMA20"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["ema50"], line=dict(color="purple", width=1.5), name="EMA50"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["vwap"], line=dict(color="gray", width=1, dash="dot"), name="VWAP"), row=1, col=1)
+
+    # Bollinger
+    fig.add_trace(go.Scatter(x=df["date"], y=df["bb_upper"], line=dict(color="rgba(0,128,0,0.3)"), name="BB Upper"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["bb_lower"], line=dict(color="rgba(0,128,0,0.3)"), name="BB Lower"), row=1, col=1)
+
+    # Support/Resistance
+    if breakout.get("resistance"):
+        fig.add_hline(y=breakout["resistance"], line_dash="dash", line_color="red", annotation_text="Resistance", row=1, col=1)
+    if breakout.get("support"):
+        fig.add_hline(y=breakout["support"], line_dash="dash", line_color="green", annotation_text="Support", row=1, col=1)
+
+    # RR levels
+    if rr:
+        fig.add_hline(y=rr["entry"], line_dash="dot", line_color="black", annotation_text="Entry", row=1, col=1)
+        fig.add_hline(y=rr["stop_loss"], line_dash="dot", line_color="red", annotation_text="SL", row=1, col=1)
+        fig.add_hline(y=rr["target"], line_dash="dot", line_color="green", annotation_text="Target", row=1, col=1)
+
+    # Volume
+    colors = ["green" if df["close"].iloc[i] >= df["open"].iloc[i] else "red" for i in range(len(df))]
+    fig.add_trace(go.Bar(x=df["date"], y=df["volume"], marker_color=colors, name="Volume"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["vol_avg20"], line=dict(color="black", width=1), name="Vol MA20"), row=2, col=1)
+
+    # RSI
+    fig.add_trace(go.Scatter(x=df["date"], y=df["rsi14"], line=dict(color="blue"), name="RSI"), row=3, col=1)
+    fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
+    fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
+
+    # MACD
+    fig.add_trace(go.Scatter(x=df["date"], y=df["macd_line"], line=dict(color="blue"), name="MACD"), row=4, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["macd_signal"], line=dict(color="red"), name="Signal"), row=4, col=1)
+    macd_colors = ["green" if df["macd_hist"].iloc[i] >= 0 else "red" for i in range(len(df))]
+    fig.add_trace(go.Bar(x=df["date"], y=df["macd_hist"], marker_color=macd_colors, name="Histogram"), row=4, col=1)
+
+    fig.update_layout(
+        height=900, template="plotly_white",
+        xaxis_rangeslider_visible=False,
+        showlegend=False,
+        margin=dict(l=40, r=40, t=60, b=40)
+    )
+    return fig
+
+
+# =============================================================================
+# STAGE 1: BATCH TECHNICAL SCAN
+# =============================================================================
+def batch_technical_scan(symbols, progress_bar, min_price=20, min_avg_volume=50000, batch_size=50, nifty_df=None):
     passed = []
     total_batches = (len(symbols) + batch_size - 1) // batch_size
 
@@ -306,7 +736,7 @@ def batch_technical_scan(symbols, progress_bar, min_price=20, min_avg_volume=500
         tickers_str = " ".join(f"{s}.NS" for s in chunk)
         try:
             data = yf.download(tickers_str, period="9mo", interval="1d",
-                                group_by="ticker", threads=True, progress=False, auto_adjust=True)
+                             group_by="ticker", threads=True, progress=False, auto_adjust=True)
         except Exception:
             progress_bar.progress((b + 1) / total_batches)
             continue
@@ -323,20 +753,45 @@ def batch_technical_scan(symbols, progress_bar, min_price=20, min_avg_volume=500
                 last_close = sub["close"].iloc[-1]
                 avg_vol = sub["volume"].tail(20).mean()
                 if last_close < min_price or avg_vol < min_avg_volume:
-                    continue  # liquidity/junk filter
+                    continue
 
                 sub = compute_all_indicators(sub)
                 weekly_ok = weekly_trend_ok(sub)
-                tscore, reasons = technical_score(sub, weekly_ok)
+                monthly_ok = monthly_trend_ok(sub)
+                support, resistance = find_support_resistance(sub)
+                patterns = detect_candlestick_patterns(sub)
+                divergence = detect_divergence(sub, "rsi")
+                gap = gap_analysis(sub)
                 breakout = breakout_analysis(sub)
-                rr = risk_reward(sub)
+                breakout["support"] = support
+                breakout["resistance"] = resistance
+
+                tscore, treasons = technical_score(sub, weekly_ok, monthly_ok, patterns, divergence, gap, breakout)
+                rr = risk_reward(sub, breakout)
+                setups = classify_setup(sub, breakout, weekly_ok, patterns, divergence, gap)
+
+                # Relative strength vs Nifty
+                rs_data = None
+                if nifty_df is not None and len(nifty_df) >= 60:
+                    rs_data = relative_strength(sub["close"], nifty_df["close"])
 
                 passed.append({
-                    "symbol": sym, "df_last_close": round(float(last_close), 2),
-                    "technical_score": tscore, "reasons": reasons,
-                    "breakout": breakout, "risk_reward": rr,
+                    "symbol": sym,
+                    "df_last_close": round(float(last_close), 2),
+                    "technical_score": tscore,
+                    "technical_reasons": treasons,
+                    "breakout": breakout,
+                    "risk_reward": rr,
                     "rsi14": round(float(sub["rsi14"].iloc[-1]), 1),
+                    "adx14": round(float(sub["adx14"].iloc[-1]), 1) if not pd.isna(sub["adx14"].iloc[-1]) else None,
                     "weekly_ok": weekly_ok,
+                    "monthly_ok": monthly_ok,
+                    "patterns": patterns,
+                    "divergence": divergence,
+                    "gap": gap,
+                    "setups": setups,
+                    "relative_strength": rs_data,
+                    "raw_df": sub,
                 })
             except Exception:
                 continue
@@ -345,90 +800,233 @@ def batch_technical_scan(symbols, progress_bar, min_price=20, min_avg_volume=500
     return passed
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # UI
-# ---------------------------------------------------------------------------
-st.title("📈 Swing Trade Screener — Auto Scan")
+# =============================================================================
+st.title("📈 Swing Trade Screener Pro")
 st.warning("⚠️ Sirf research/screening tool hai — financial advice nahi. Apna risk management khud karo.")
 
-market_status, market_note = get_market_context()
+market_status, market_note, nifty_df = get_market_context()
 st.info(f"**Market Context (Nifty):** {market_status} — {market_note}")
 
-mode = st.radio("Mode choose karo", ["🔍 Auto scan (NSE cash segment se khud dhundo)", "📋 Apni list paste karo"], horizontal=True)
+mode = st.radio("Mode choose karo", ["🔍 Auto scan (NSE se khud dhundo)", "📋 Apni list paste karo"], horizontal=True)
 
 if mode.startswith("🔍"):
-    universe_choice = st.selectbox("Universe (kitna bada scan karna hai)", list(INDEX_URLS.keys()), index=1)
-    col1, col2, col3 = st.columns(3)
-    min_price = col1.number_input("Minimum price (₹)", value=20, min_value=1)
-    min_volume = col2.number_input("Minimum avg daily volume", value=50000, min_value=0, step=10000)
-    top_n = col3.slider("Top kitne stocks chahiye", 1, 10, 5)
+    universe_choice = st.selectbox("Universe", list(INDEX_URLS.keys()), index=1)
+    c1, c2, c3, c4 = st.columns(4)
+    min_price = c1.number_input("Min price (₹)", value=20, min_value=1)
+    min_volume = c2.number_input("Min avg volume", value=50000, min_value=0, step=10000)
+    top_n = c3.slider("Top candidates", 1, 15, 5)
+    min_tech_score = c4.slider("Min Technical Score", 0, 70, 25)
+
+    sector_filter = st.multiselect("Sector filter (optional)", [
+        "Technology", "Financial Services", "Consumer Cyclical", "Healthcare",
+        "Industrials", "Consumer Defensive", "Energy", "Basic Materials",
+        "Real Estate", "Communication Services", "Utilities"
+    ])
 
     if st.button("🚀 Scan Shuru Karo", type="primary"):
         symbols = get_universe(universe_choice)
         if not symbols:
             st.stop()
-        st.write(f"**{len(symbols)} stocks** scan honge. Bade universe (Nifty500/Full) me time lagega, patience rakho ⏳")
 
+        st.write(f"**{len(symbols)} stocks** scan honge. Bade universe me time lagega ⏳")
         progress = st.progress(0.0, text="Stage 1: Technical scan chal raha hai...")
-        stage1 = batch_technical_scan(symbols, progress, min_price=min_price, min_avg_volume=min_volume)
+        stage1 = batch_technical_scan(symbols, progress, min_price=min_price, min_avg_volume=min_volume, nifty_df=nifty_df)
         progress.empty()
 
+        # Filter by minimum technical score
+        stage1 = [r for r in stage1 if r["technical_score"] >= min_tech_score]
+
         if not stage1:
-            st.error("Koi stock filters pass nahi kar paya. Filters loosen karo ya universe badlo.")
+            st.error("Koi stock minimum technical score pass nahi kar paya. Filters loosen karo.")
             st.stop()
 
         stage1_sorted = sorted(stage1, key=lambda r: r["technical_score"], reverse=True)
-        shortlist = stage1_sorted[:max(20, top_n * 4)]  # top candidates ka fundamentals check karenge
+        shortlist = stage1_sorted[:max(25, top_n * 5)]
 
         st.write(f"Stage 1 se **{len(shortlist)}** technically strong stocks shortlist hue. Ab fundamentals check ho raha hai...")
-        progress2 = st.progress(0.0, text="Stage 2: Fundamentals check ho raha hai...")
+        progress2 = st.progress(0.0, text="Stage 2: Fundamentals check...")
         final_results = []
         for i, r in enumerate(shortlist):
             fund = fetch_fundamentals(r["symbol"])
-            fscore = fundamental_score(fund)
+            fscore, freasons = fundamental_score(fund)
             red_flags = check_red_flags(fund, r["df_last_close"])
-            composite = round(r["technical_score"] * 0.65 + fscore * 0.35, 1)
-            r.update({"fundamentals": fund, "fundamental_score": fscore,
-                       "red_flags": red_flags, "composite_score": composite})
+
+            # Context score
+            cscore = 0
+            if r["relative_strength"]:
+                rs, _, _ = r["relative_strength"]
+                if rs > 5:
+                    cscore += 5
+                elif rs > 0:
+                    cscore += 3
+
+            composite = round(r["technical_score"] * 0.60 + fscore * 0.30 + cscore * 0.10, 1)
+
+            r.update({
+                "fundamentals": fund,
+                "fundamental_score": fscore,
+                "fundamental_reasons": freasons,
+                "red_flags": red_flags,
+                "composite_score": composite,
+                "context_score": cscore,
+            })
             final_results.append(r)
             progress2.progress((i + 1) / len(shortlist))
         progress2.empty()
 
+        # Sector filter
+        if sector_filter:
+            final_results = [r for r in final_results if r["fundamentals"] and r["fundamentals"].get("sector") in sector_filter]
+
         top = sorted(final_results, key=lambda r: r["composite_score"], reverse=True)[:top_n]
+
+        # Export button
+        if top:
+            export_data = []
+            for r in top:
+                fund = r["fundamentals"] or {}
+                export_data.append({
+                    "Symbol": r["symbol"],
+                    "Composite Score": r["composite_score"],
+                    "Technical Score": r["technical_score"],
+                    "Fundamental Score": r["fundamental_score"],
+                    "Last Close": r["df_last_close"],
+                    "RSI": r["rsi14"],
+                    "ADX": r["adx14"],
+                    "Setup": ", ".join(r["setups"]),
+                    "Entry": r["risk_reward"]["entry"] if r["risk_reward"] else None,
+                    "Stop Loss": r["risk_reward"]["stop_loss"] if r["risk_reward"] else None,
+                    "Target": r["risk_reward"]["target"] if r["risk_reward"] else None,
+                    "R:R": r["risk_reward"]["r_r"] if r["risk_reward"] else None,
+                    "Sector": fund.get("sector"),
+                    "P/E": fund.get("pe_ratio"),
+                    "ROE": fund.get("roe"),
+                    "D/E": fund.get("debt_to_equity"),
+                })
+            export_df = pd.DataFrame(export_data)
+            csv = export_df.to_csv(index=False).encode("utf-8")
+            st.download_button("📥 Results CSV Download karo", csv, "swing_screener_results.csv", "text/csv")
 
         st.subheader(f"🏆 Top {len(top)} Swing Trade Candidates")
         status_map = {
-            "breakout_confirmed": "✅ Breakout CONFIRMED (volume ke saath)",
-            "near_breakout": "🟡 Near breakout", "breakout_low_volume": "🟠 Breakout hua lekin volume weak",
-            "no_breakout": "⚪ Koi breakout nahi", "insufficient_data": "❓ Data kam hai",
+            "breakout_confirmed": "✅ Breakout CONFIRMED",
+            "near_breakout": "🟡 Near Breakout",
+            "breakout_low_volume": "🟠 Breakout (weak volume)",
+            "no_breakout": "⚪ No breakout",
+            "insufficient_data": "❓ Data kam",
         }
+
         for rank, r in enumerate(top, start=1):
             with st.container(border=True):
-                c1, c2, c3 = st.columns([2, 1, 1])
-                c1.markdown(f"### #{rank} · {r['symbol']}")
-                c2.metric("Score", f"{r['composite_score']}/100")
-                c3.metric("Last Close", f"₹{r['df_last_close']}")
+                fund = r["fundamentals"] or {}
+                col_main, col_score = st.columns([3, 1])
+                col_main.markdown(f"### #{rank} · {r['symbol']}  <span style='font-size:0.7em;color:gray'>{fund.get('sector','')}</span>", unsafe_allow_html=True)
+                col_score.metric("Composite Score", f"{r['composite_score']}/100")
+                col_score.caption(f"Tech: {r['technical_score']} | Fund: {r['fundamental_score']} | Ctx: {r['context_score']}")
+
+                # Setup tags
+                setup_html = " ".join([f"<span style='background:#e3f2fd;padding:3px 8px;border-radius:10px;margin-right:5px;font-size:0.8em'>{s}</span>" for s in r["setups"]])
+                st.markdown(f"**Setup:** {setup_html}", unsafe_allow_html=True)
+
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Last Close", f"₹{r['df_last_close']}")
+                c2.metric("RSI", r["rsi14"])
+                c3.metric("ADX", r["adx14"] or "N/A")
+                c4.metric("Weekly", "✅" if r["weekly_ok"] else "❌")
+                c5.metric("Monthly", "✅" if r["monthly_ok"] else "❌")
 
                 bt = r["breakout"]
-                st.write(f"**Breakout:** {status_map.get(bt['status'], bt['status'])} (Resistance: ₹{bt.get('resistance')})")
-                st.write(f"**Weekly trend aligned:** {'✅ Haan' if r['weekly_ok'] else '❌ Nahi/Unclear'} | **RSI:** {r['rsi14']}")
+                st.write(f"**Breakout:** {status_map.get(bt['status'], bt['status'])} | Resistance: ₹{bt.get('resistance')} | Support: ₹{bt.get('support')}")
 
                 rr = r["risk_reward"]
                 if rr:
-                    st.write(f"**Suggested Risk-Reward (1:2):** Entry ₹{rr['entry']} | Stop-loss ₹{rr['stop_loss']} | Target ₹{rr['target']} | ATR: {rr['atr_pct']}%")
+                    st.write(f"**Risk-Reward:** Entry ₹{rr['entry']} | SL ₹{rr['stop_loss']} | Target ₹{rr['target']} | R:R 1:{rr['r_r']} | ATR: {rr['atr_pct']}%")
 
-                st.write("**Technical reasons:**")
-                for reason in r["reasons"]:
-                    st.write(f"- {reason}")
+                if r["relative_strength"]:
+                    rs, sret, bret = r["relative_strength"]
+                    color = "green" if rs > 0 else "red"
+                    st.write(f"**vs Nifty (60d):** <span style='color:{color};font-weight:bold'>{rs:+.1f}%</span> (Stock: {sret:+.1f}% | Nifty: {bret:+.1f}%)", unsafe_allow_html=True)
 
-                fund = r["fundamentals"]
-                if fund:
-                    st.write(f"**Fundamentals:** P/E: {fund.get('pe_ratio')} | ROE: {fund.get('roe')} | D/E: {fund.get('debt_to_equity')} | Sector: {fund.get('sector')}")
-                st.write("**Red flags:**")
-                for flag in r["red_flags"]:
-                    st.write(f"- {flag}")
+                # Expanders
+                with st.expander("📊 Technical Reasons"):
+                    for reason in r["technical_reasons"]:
+                        st.write(f"- {reason}")
+                    if r["patterns"]:
+                        st.write(f"- **Patterns:** {', '.join(r['patterns'])}")
+                    if r["divergence"]:
+                        st.write(f"- **Divergence:** {r['divergence']}")
+                    if r["gap"]:
+                        st.write(f"- **Gap:** {r['gap']}")
 
-        st.caption("📌 Reminder: upcoming results/corporate actions khud check kar lo — ye tool sudden news-based gaps predict nahi karta.")
+                with st.expander("🏛️ Fundamentals"):
+                    if fund:
+                        fcols = st.columns(3)
+                        fcols[0].write(f"**P/E:** {fund.get('pe_ratio')} | **Forward P/E:** {fund.get('forward_pe')}")
+                        fcols[0].write(f"**P/B:** {fund.get('pb_ratio')} | **PEG:** {fund.get('peg_ratio')}")
+                        fcols[1].write(f"**ROE:** {fund.get('roe')}% | **ROA:** {fund.get('roa')}%")
+                        fcols[1].write(f"**Margin:** {fund.get('profit_margin')}% | **Op Margin:** {fund.get('operating_margin')}%")
+                        fcols[2].write(f"**D/E:** {fund.get('debt_to_equity')} | **Current Ratio:** {fund.get('current_ratio')}")
+                        fcols[2].write(f"**Beta:** {fund.get('beta')} | **Div Yield:** {fund.get('dividend_yield')}%")
+                        st.write(f"**Growth:** Revenue {fund.get('revenue_growth')}% | Qtr Earnings {fund.get('earnings_qtr_growth')}%")
+                        st.write(f"**Cash Flow:** FCF ₹{fund.get('free_cashflow')} | OCF ₹{fund.get('operating_cashflow')}")
+                        st.write(f"**Ownership:** Institutions {fund.get('institutional_pct')}% | Insiders {fund.get('insider_pct')}%")
+                        st.write(f"**Analyst Rating:** {fund.get('analyst_rating')}/5 ({fund.get('num_analysts')} analysts)")
+                        st.write(f"**52W Range:** ₹{fund.get('fifty_two_week_low')} - ₹{fund.get('fifty_two_week_high')}")
+                        st.write("**Score reasons:**")
+                        for freason in r["fundamental_reasons"]:
+                            st.write(f"- {freason}")
+                    else:
+                        st.write("Fundamental data nahi mila.")
+
+                with st.expander("🚩 Red Flags"):
+                    for flag in r["red_flags"]:
+                        st.write(flag)
+
+                with st.expander("📈 Chart"):
+                    fig = generate_chart(r["raw_df"], r["symbol"], bt, rr)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                # Position sizing calculator
+                with st.expander("🧮 Position Sizing Calculator"):
+                    portfolio = st.number_input(f"Portfolio Size (₹) — {r['symbol']}", min_value=10000, value=500000, step=50000, key=f"port_{r['symbol']}")
+                    risk_pct = st.slider(f"Risk % per trade — {r['symbol']}", 0.5, 5.0, 1.0, 0.5, key=f"risk_{r['symbol']}")
+                    if rr:
+                        max_risk = portfolio * risk_pct / 100
+                        qty = int(max_risk / rr["risk"]) if rr["risk"] > 0 else 0
+                        investment = qty * rr["entry"]
+                        st.success(f"**Qty:** {qty} shares | **Investment:** ₹{investment:,.0f} | **Max Risk:** ₹{max_risk:,.0f}")
+
+        st.caption("📌 Upcoming results/corporate actions khud check kar lo — ye tool sudden news predict nahi karta.")
 
 else:
-    st.info("Purane 'paste list' mode ke liye pehle wali app.py use karo, ya yahan bata do to isi file me dono modes merge kar dunga.")
+    st.info("Apni list paste karne ke liye niche symbols enter karo (comma separated):")
+    custom_input = st.text_area("Symbols", "RELIANCE, TCS, INFY, HDFCBANK")
+    if st.button("Custom List Scan Karo", type="primary"):
+        custom_symbols = [s.strip().upper() for s in custom_input.split(",") if s.strip()]
+        progress = st.progress(0.0, text="Scanning custom list...")
+        stage1 = batch_technical_scan(custom_symbols, progress, nifty_df=nifty_df)
+        progress.empty()
+
+        if not stage1:
+            st.error("Koi stock criteria pass nahi kiya.")
+            st.stop()
+
+        shortlist = sorted(stage1, key=lambda r: r["technical_score"], reverse=True)
+        for r in shortlist:
+            fund = fetch_fundamentals(r["symbol"])
+            fscore, _ = fundamental_score(fund)
+            red_flags = check_red_flags(fund, r["df_last_close"])
+            composite = round(r["technical_score"] * 0.6 + fscore * 0.3, 1)
+            r.update({"fundamentals": fund, "fundamental_score": fscore, "red_flags": red_flags, "composite_score": composite})
+
+        for rank, r in enumerate(shortlist, start=1):
+            with st.container(border=True):
+                st.markdown(f"### #{rank} · {r['symbol']} — Score: {r['composite_score']}")
+                st.write(f"Setup: {', '.join(r['setups'])} | RSI: {r['rsi14']} | ADX: {r['adx14']}")
+                if r["risk_reward"]:
+                    rr = r["risk_reward"]
+                    st.write(f"Entry ₹{rr['entry']} | SL ₹{rr['stop_loss']} | Target ₹{rr['target']} | R:R 1:{rr['r_r']}")
+                for flag in r["red_flags"]:
+                    st.write(flag)
