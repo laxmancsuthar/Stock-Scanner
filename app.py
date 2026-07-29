@@ -1659,8 +1659,8 @@ if page == "🔍 Scanner":
         list(SETUP_LABELS.keys())[:-1],
         format_func=lambda k: SETUP_LABELS.get(k, k),
     )
-    min_tech = st.sidebar.slider("Min technical score", 0, 100, 0)
-    min_fund = st.sidebar.slider("Min fundamental score", 0, 100, 0)
+    min_tech = st.sidebar.slider("Min technical score", 0, 100, 70)
+    min_fund = st.sidebar.slider("Min fundamental score", 0, 100, 60)
 
     st.sidebar.markdown("**Market Cap range (₹ Crore)**")
     mc1, mc2 = st.sidebar.columns(2)
@@ -1669,7 +1669,7 @@ if page == "🔍 Scanner":
     st.sidebar.caption("e.g. Small cap < 5,000 Cr · Mid cap 5,000–20,000 Cr · Large cap > 20,000 Cr")
 
     top_n = st.sidebar.slider(
-        "Show top N stocks", 1, 15, 15,
+        "Show top N stocks", 1, 15, 5,
         help="Only the top N matches (by combined technical + fundamental score) will be shown/exported.",
     )
 
