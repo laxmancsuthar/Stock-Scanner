@@ -140,6 +140,7 @@ NIFTY_50_NS = _add_suffix(NIFTY_50)
 NIFTY_100_NS = _add_suffix(NIFTY_50 + NIFTY_NEXT_50)
 NIFTY_200_NS = _add_suffix(list(dict.fromkeys(NIFTY_50 + NIFTY_NEXT_50 + MIDCAPS)))
 NIFTY_500_NS = _add_suffix(list(dict.fromkeys(NIFTY_50 + NIFTY_NEXT_50 + MIDCAPS + SMALLCAPS)))
+ALL_KNOWN_SYMBOLS = sorted(set(t.replace(".NS", "") for t in NIFTY_500_NS))
 
 
 def get_universe(name: str):
@@ -1628,13 +1629,40 @@ def render_stock_detail(symbol: str):
 
 
 # ---------------------------- Sidebar navigation -----------------------
-st.sidebar.title("📈 Swing Trade Screener Pro")
+st.sidebar.title("📈 Stocks With Laxman")
 st.sidebar.caption("Unified Engine — merged from both scanners")
 page = st.sidebar.radio("Navigate", ["🔍 Scanner", "⭐ Watchlist", "🧮 Position Sizing", "ℹ️ About"], label_visibility="collapsed")
 
 st.sidebar.markdown("---")
 
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def get_lookup_symbols() -> List[str]:
+    """Full pool of symbols used for the Quick lookup autocomplete.
+    Tries to pull the complete NSE cash-segment list (1500+ stocks, so
+    recently listed names like WAAREEENER / WAAREERTL are included too);
+    falls back to the built-in Nifty 500 list if NSE blocks the request."""
+    live = get_universe_live("Full NSE Cash Segment (slow, 1500+ stocks)")
+    if live:
+        return sorted(set(t.replace(".NS", "") for t in live))
+    return ALL_KNOWN_SYMBOLS
+
+
 lookup = st.sidebar.text_input("Quick lookup (NSE symbol)", placeholder="e.g. RELIANCE")
+if lookup.strip():
+    query = lookup.strip().upper()
+    lookup_pool = get_lookup_symbols()
+    starts = sorted(s for s in lookup_pool if s.startswith(query))
+    contains = sorted(s for s in lookup_pool if query in s and not s.startswith(query))
+    suggestions = (starts + contains)[:8]
+    if suggestions:
+        st.sidebar.caption("Matching symbols — click to view:")
+        for s in suggestions:
+            if st.sidebar.button(s, key=f"suggest_{s}", use_container_width=True):
+                st.session_state.selected_symbol = f"{s}.NS"
+                page = "🔍 Scanner"
+                st.rerun()
+    else:
+        st.sidebar.caption("No matching symbols found.")
 if st.sidebar.button("View stock", use_container_width=True) and lookup.strip():
     sym = lookup.strip().upper()
     if not sym.endswith(".NS"):
@@ -1646,7 +1674,7 @@ if st.sidebar.button("View stock", use_container_width=True) and lookup.strip():
 if page == "🔍 Scanner":
     st.sidebar.markdown("### Scan Filters")
     universe_label = st.sidebar.selectbox(
-        "Universe", ["Nifty 50", "Nifty 200", "Nifty 500", "Full NSE Cash Segment (slow, 1500+ stocks)"], index=0,
+        "Universe", ["Nifty 50", "Nifty 200", "Nifty 500", "Full NSE Cash Segment (slow, 1500+ stocks)"], index=2,
     )
     use_live_nse = st.sidebar.checkbox(
         "Fetch live list from NSE", value=True,
@@ -1670,7 +1698,7 @@ if page == "🔍 Scanner":
 
     top_n = st.sidebar.slider(
         "Show top N stocks", 1, 15, 5,
-        help="Only the top N matches (by combined technical + fundamental score) will be shown/exported.",
+        help="Only the top N matches (by combined technical + fundamental score) will be shown. CSV export always includes every scanned match.",
     )
 
     run_col, clear_col = st.sidebar.columns(2)
@@ -1753,8 +1781,19 @@ if page == "🔍 Scanner":
         } for r in results])
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-        csv_bytes = df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Export results to CSV", csv_bytes, "scan_results.csv", "text/csv")
+        # CSV export always contains every scanned match, not just the top-N shown above
+        df_all = pd.DataFrame([{
+            "Symbol": r["base_symbol"], "Name": r["name"], "Sector": r["sector"],
+            "Price (₹)": round(r["price"], 2), "Change %": round(r["change_pct"], 2),
+            "Market Cap (₹ Cr)": round(r["market_cap"] / 1e7, 0) if r.get("market_cap") else None,
+            "Tech Score": r["technical_score"], "Fund Score": r["fundamental_score"],
+            "Setups": ", ".join(SETUP_LABELS.get(s, s) for s in (r.get("setups") or [r["setup_type"]])),
+        } for r in all_results])
+        csv_bytes = df_all.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            f"⬇️ Export results to CSV ({len(all_results)} stock{'s' if len(all_results) != 1 else ''})",
+            csv_bytes, "scan_results.csv", "text/csv",
+        )
 
         symbol_options = {f"{r['base_symbol']} — {r['name']}": r["symbol"] for r in results}
         pick = st.selectbox("View detail for:", list(symbol_options.keys()))
