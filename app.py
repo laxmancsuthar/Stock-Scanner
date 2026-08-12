@@ -23,11 +23,12 @@ from __future__ import annotations
 
 import json
 import io
+import tempfile
 import threading
 import time as _time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -35,6 +36,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
 import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
@@ -986,6 +988,406 @@ def fetch_stock_detail(symbol: str, period: str = "1y") -> Optional[Dict[str, An
 
 
 # ============================================================================
+# SECTION 3B: nse_extra.py — Promoter/FII/DII/Public holding + Bulk/Block deals
+# ----------------------------------------------------------------------------
+# Uses the `nse` PyPI package (BennyThadikaran/NseIndiaApi) instead of hand-
+# rolled requests calls. It handles NSE's cookie warm-up and correct endpoint
+# paths for us, and — importantly — NSE's edge/WAF blocks plain `requests`
+# (HTTP/1.1) traffic from datacenter/cloud IPs with 503s; the library works
+# around this with an httpx HTTP/2 client when `server=True` is passed.
+#
+# Install:  pip install nse
+# If deploying on a server/cloud host (Streamlit Cloud, AWS, Docker, etc.),
+# also:     pip install "httpx[http2]"   and set NSE_RUN_ON_SERVER = True below.
+# Running locally on your own machine/laptop, leave it False.
+# ============================================================================
+
+NSE_RUN_ON_SERVER = False  # True if this app is deployed on a cloud/server host
+
+try:
+    from nse import NSE as _NSEClient
+    _NSE_LIB_AVAILABLE = True
+except ImportError:
+    _NSE_LIB_AVAILABLE = False
+
+
+@st.cache_resource(show_spinner=False)
+def _get_nse_client():
+    """One shared NSE client for the app's lifetime (reuses cookies/session)."""
+    if not _NSE_LIB_AVAILABLE:
+        return None
+    cookie_dir = Path(tempfile.gettempdir()) / "nse_cookies"
+    cookie_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        return _NSEClient(download_folder=str(cookie_dir), server=NSE_RUN_ON_SERVER, timeout=15)
+    except Exception:
+        return None
+
+
+def fetch_nse_debug(symbol: str) -> Dict[str, Any]:
+    """No-cache diagnostic call against each data source — returns status/error
+    text for each, so a broken call can be identified from the UI directly."""
+    base = symbol.replace(".NS", "")
+    results: Dict[str, Any] = {}
+
+    # Shareholding now comes from screener.in (see fetch_shareholding_filings) —
+    # test that path here too so debug mode covers the real code path.
+    try:
+        sh = fetch_shareholding_filings(symbol)
+        results["shareholding (screener.in)"] = {"status": "OK" if sh else "EMPTY", "body": str(sh)[:800]}
+    except Exception as e:
+        results["shareholding (screener.in)"] = {"status": type(e).__name__, "body": str(e)[:800]}
+
+    try:
+        dv = fetch_delivery_history(symbol, lookback_days=20, want_rows=10)
+        results["delivery % (nse bhavcopy)"] = {"status": "OK" if dv else "EMPTY", "body": str(dv)[:800]}
+    except Exception as e:
+        results["delivery % (nse bhavcopy)"] = {"status": type(e).__name__, "body": str(e)[:800]}
+
+    if not _NSE_LIB_AVAILABLE:
+        results["nse package (bulk/block deals)"] = {"status": "NOT INSTALLED", "body": "Run: pip install nse"}
+        return results
+
+    for label, deal_type in (("bulk_deals", "bulk"), ("block_deals", "block")):
+        try:
+            data = fetch_all_deals_raw(deal_type, 90)  # same cached call the rest of the app uses
+            matches = [r for r in data if str(r.get("BD_SYMBOL", "")).strip().upper() == base.upper()]
+            fuzzy = [r for r in data if base.upper() in str(r.get("BD_SYMBOL", "")).strip().upper()]
+            all_symbols_repr = sorted({repr(str(r.get("BD_SYMBOL", ""))) for r in data})
+            body = (
+                f"Total records (all symbols, 90d): {len(data)} | Exact match '{base}': {len(matches)} | "
+                f"Fuzzy (contains) match: {len(fuzzy)}\n"
+                f"Sample exact matches: {str(matches[:3])[:400]}\n"
+                f"Sample fuzzy matches: {str(fuzzy[:3])[:400]}\n"
+                f"First 15 raw symbol values (repr, to spot hidden whitespace): {all_symbols_repr[:15]}"
+            )
+            results[label] = {"status": "OK", "body": body}
+        except Exception as e:
+            results[label] = {"status": type(e).__name__, "body": str(e)[:800]}
+
+    return results
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def fetch_shareholding_filings(symbol: str) -> List[Dict[str, Any]]:
+    """Promoter / FII / DII / Public shareholding (current, previous quarter,
+    QoQ change) scraped from screener.in's company page. This is a different,
+    more reliable source than NSE's JSON API — no cookie/bot-protection dance,
+    single HTML request, and screener already lines up quarter-over-quarter
+    columns so the change % can be computed directly.
+    Returns a single-row list (easiest to render as a table) with keys like
+    promoter_cur/promoter_prev/promoter_chg, fii_*, dii_*, public_*."""
+    base = symbol.replace(".NS", "")
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.screener.in/",
+    })
+
+    soup = None
+    for url in (f"https://www.screener.in/company/{base}/consolidated/",
+                f"https://www.screener.in/company/{base}/"):
+        try:
+            resp = session.get(url, timeout=12)
+            if resp.status_code == 200:
+                try:
+                    soup = BeautifulSoup(resp.text, "lxml")
+                except Exception:
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                break
+        except Exception:
+            continue
+
+    if soup is None:
+        return []
+
+    sh_section = soup.find("section", {"id": "shareholding"})
+    if not sh_section:
+        return []
+    table = sh_section.find("table")
+    if not table:
+        return []
+
+    rows = table.find_all("tr")
+    sh_data: Dict[str, List[Optional[float]]] = {}
+    for i, row in enumerate(rows):
+        cols = row.find_all(["th", "td"])
+        texts = [c.get_text(strip=True).replace("%", "").replace(",", "") for c in cols]
+        if i == 0 or not texts or not texts[0]:
+            continue
+        label = texts[0].strip()
+        try:
+            vals = [float(v) if v not in ("", "-", "--") else None for v in texts[1:]]
+        except Exception:
+            vals = [None] * len(texts[1:])
+        sh_data[label] = vals
+
+    def get_sh(keys: List[str]) -> Optional[List[Optional[float]]]:
+        for k in keys:
+            for label, vals in sh_data.items():
+                if k.lower() in label.lower():
+                    return vals
+        return None
+
+    result: Dict[str, Any] = {}
+
+    def fill(prefix: str, keys: List[str]):
+        vals = get_sh(keys)
+        if vals and len(vals) >= 1 and vals[-1] is not None:
+            result[f"{prefix}_cur"] = round(vals[-1], 2)
+            if len(vals) >= 2 and vals[-2] is not None:
+                result[f"{prefix}_prev"] = round(vals[-2], 2)
+                result[f"{prefix}_chg"] = round(vals[-1] - vals[-2], 2)
+
+    fill("promoter", ["Promoters", "Promoter"])
+    fill("fii", ["FII", "Foreign", "FPI"])
+    fill("dii", ["DII", "Domestic Institution"])
+    fill("public", ["Public"])
+
+    return [result] if result else []
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 30)
+def fetch_all_deals_raw(deal_type: str = "bulk", days: int = 90) -> List[Dict[str, Any]]:
+    """Raw bulk/block deal records for ALL symbols over the trailing `days`
+    (unfiltered). Cached once and reused both by the per-stock detail view
+    and the all-stocks 'Bulk/Block Deals' scanner page.
+
+    NSE's historicalOR endpoint appears to silently cap/paginate results for
+    wide date ranges (observed: a 90-day query and a much shorter query both
+    returning suspiciously similar totals, with some genuinely recent deals
+    missing). To work around this without relying on undocumented pagination
+    params, the requested window is split into ~15-day chunks, each fetched
+    separately and merged — a much smaller range per request is far less
+    likely to hit whatever cap NSE applies."""
+    if not _NSE_LIB_AVAILABLE:
+        return []
+    client = _get_nse_client()
+    if client is None:
+        return []
+    option_type = "bulk_deals" if deal_type == "bulk" else "block_deals"
+
+    chunk_days = 15 if days <= 90 else 30
+    to_dt = datetime.now()
+    start_dt = to_dt - timedelta(days=days)
+
+    all_rows: List[Dict[str, Any]] = []
+    seen_keys = set()
+    chunk_end = to_dt
+    while chunk_end > start_dt:
+        chunk_start = max(start_dt, chunk_end - timedelta(days=chunk_days))
+        try:
+            rows = client.bulkdeals(option_type, chunk_start, chunk_end)
+        except RuntimeError:
+            rows = []  # no deals in this particular chunk — not an error
+        except Exception:
+            rows = []
+        for r in rows:
+            key = (
+                r.get("BD_DT_DATE"), r.get("BD_SYMBOL"), r.get("BD_CLIENT_NAME"),
+                r.get("BD_BUY_SELL"), r.get("BD_QTY_TRD"), r.get("BD_TP_WATP"),
+            )
+            if key not in seen_keys:
+                seen_keys.add(key)
+                all_rows.append(r)
+        chunk_end = chunk_start
+
+    return all_rows
+
+
+def _normalize_deal_row(r: Dict[str, Any]) -> Dict[str, Any]:
+    sym = r.get("BD_SYMBOL") or r.get("symbol")
+    sec = r.get("BD_SCRIP_NAME") or r.get("scripName")
+    cli = r.get("BD_CLIENT_NAME") or r.get("clientName")
+    return {
+        "Date": r.get("BD_DT_DATE") or r.get("date"),
+        "Symbol": sym.strip() if isinstance(sym, str) else sym,
+        "Security": sec.strip() if isinstance(sec, str) else sec,
+        "Client": cli.strip() if isinstance(cli, str) else cli,
+        "Buy/Sell": r.get("BD_BUY_SELL") or r.get("buySell"),
+        "Qty": r.get("BD_QTY_TRD") or r.get("qty"),
+        "Price": r.get("BD_TP_WATP") or r.get("price"),
+    }
+
+
+def fetch_deals(symbol: str, deal_type: str = "bulk", days: int = 90) -> List[Dict[str, Any]]:
+    """Bulk or block deals for a single symbol over the trailing `days`.
+    deal_type: 'bulk' or 'block'."""
+    base = symbol.replace(".NS", "")
+    rows = fetch_all_deals_raw(deal_type, days)
+    out = []
+    for r in rows:
+        if str(r.get("BD_SYMBOL") or r.get("symbol") or "").strip().upper() != base.upper():
+            continue
+        row = _normalize_deal_row(r)
+        row.pop("Symbol", None)
+        row.pop("Security", None)
+        out.append(row)
+    return out
+
+
+def fetch_all_deals(deal_type: str = "bulk", days: int = 90) -> pd.DataFrame:
+    """All symbols' bulk/block deals over the trailing `days` as a DataFrame —
+    powers the 'Bulk/Block Deals' scanner page."""
+    rows = fetch_all_deals_raw(deal_type, days)
+    if not rows:
+        return pd.DataFrame(columns=["Date", "Symbol", "Security", "Client", "Buy/Sell", "Qty", "Price"])
+    return pd.DataFrame([_normalize_deal_row(r) for r in rows])
+
+
+# ----------------------------------------------------------------------------
+# Delivery % — NSE's daily full-market "bhavcopy with delivery" CSV
+# ----------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def _fetch_bhavcopy_day(date_str: str) -> Optional[pd.DataFrame]:
+    """Full-market delivery bhavcopy (ALL symbols, one trading day) as a
+    DataFrame. Cached per calendar day so every stock's detail view reuses
+    the same download instead of re-fetching per symbol."""
+    if not _NSE_LIB_AVAILABLE:
+        return None
+    client = _get_nse_client()
+    if client is None:
+        return None
+    date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+    try:
+        path = client.deliveryBhavcopy(date_obj)
+        df = pd.read_csv(path)
+        df.columns = [c.strip() for c in df.columns]
+        return df
+    except Exception:
+        return None  # weekend/holiday/report not yet published — not an error
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def fetch_delivery_history(symbol: str, lookback_days: int = 20, want_rows: int = 10) -> List[Dict[str, Any]]:
+    """Trailing delivery qty/% for a symbol, most recent trading day first.
+    Walks backward day-by-day — skipping weekends and any day the report
+    isn't available (holiday, or same-day before EOD publish) — until
+    `want_rows` valid records are collected or `lookback_days` calendar
+    days have been checked."""
+    base = symbol.replace(".NS", "").strip().upper()
+    out: List[Dict[str, Any]] = []
+    d = datetime.now()
+    checked = 0
+    while checked < lookback_days and len(out) < want_rows:
+        if d.weekday() < 5:  # Mon-Fri only; weekends never have a report
+            df = _fetch_bhavcopy_day(d.strftime("%Y-%m-%d"))
+            if df is not None and not df.empty and "SYMBOL" in df.columns:
+                mask = df["SYMBOL"].astype(str).str.strip().str.upper() == base
+                if "SERIES" in df.columns:
+                    mask &= df["SERIES"].astype(str).str.strip().str.upper() == "EQ"
+                match = df[mask]
+                if not match.empty:
+                    r = match.iloc[0]
+
+                    def g(*names):
+                        for n in names:
+                            if n in match.columns:
+                                return r[n]
+                        return None
+
+                    out.append({
+                        "Date": d.strftime("%d-%b-%Y"),
+                        "Close": g("CLOSE_PRICE", "CLOSE"),
+                        "Traded Qty": g("TTL_TRD_QNTY", "TTL_TRD_QTY"),
+                        "Delivery Qty": g("DELIV_QTY"),
+                        "Delivery %": g("DELIV_PER"),
+                    })
+        d -= timedelta(days=1)
+        checked += 1
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def fetch_delivery_avg_all_symbols(trading_days_needed: int = 10, lookback_days: int = 20) -> pd.DataFrame:
+    """Average Delivery % per symbol (EQ series) over the last
+    `trading_days_needed` valid trading days — walks back up to
+    `lookback_days` calendar days to collect enough data points, skipping
+    weekends/holidays where no report exists. Reuses the same per-day
+    bhavcopy cache as the single-day leaderboard, so days already fetched
+    for one average aren't re-downloaded for the other."""
+    d = datetime.now()
+    checked = 0
+    collected = 0
+    frames = []
+    while checked < lookback_days and collected < trading_days_needed:
+        if d.weekday() < 5:
+            df = _fetch_bhavcopy_day(d.strftime("%Y-%m-%d"))
+            if df is not None and not df.empty and "SYMBOL" in df.columns and "DELIV_PER" in df.columns:
+                work = df.copy()
+                if "SERIES" in work.columns:
+                    work = work[work["SERIES"].astype(str).str.strip().str.upper() == "EQ"]
+                sub = work[["SYMBOL", "DELIV_PER"]].copy()
+                sub["SYMBOL"] = sub["SYMBOL"].astype(str).str.strip()
+                sub["DELIV_PER"] = pd.to_numeric(sub["DELIV_PER"], errors="coerce")
+                frames.append(sub)
+                collected += 1
+        d -= timedelta(days=1)
+        checked += 1
+    if not frames:
+        return pd.DataFrame(columns=["Symbol", "Avg Delivery %"])
+    allrows = pd.concat(frames, ignore_index=True)
+    grouped = allrows.groupby("SYMBOL")["DELIV_PER"].mean().reset_index()
+    grouped.columns = ["Symbol", "Avg Delivery %"]
+    return grouped
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def fetch_market_delivery_leaderboard(lookback_days: int = 5) -> pd.DataFrame:
+    """Full-market Delivery % for every EQ-series stock on the most recent
+    available trading day (walks backward up to `lookback_days` calendar
+    days to find a published report — handles weekends/holidays and the
+    same-day-before-EOD-publish case), plus 10-day and ~monthly (22 trading
+    day) average Delivery % per symbol. Sorted by (latest-day) Delivery %
+    descending, so 'best delivery' stocks are simply the top rows."""
+    d = datetime.now()
+    checked = 0
+    while checked < lookback_days:
+        if d.weekday() < 5:
+            df = _fetch_bhavcopy_day(d.strftime("%Y-%m-%d"))
+            if df is not None and not df.empty and "SYMBOL" in df.columns:
+                work = df.copy()
+                if "SERIES" in work.columns:
+                    work = work[work["SERIES"].astype(str).str.strip().str.upper() == "EQ"]
+
+                def col(*names):
+                    for n in names:
+                        if n in work.columns:
+                            return work[n]
+                    return None
+
+                result = pd.DataFrame({
+                    "Symbol": work["SYMBOL"].astype(str).str.strip(),
+                    "Close": pd.to_numeric(col("CLOSE_PRICE", "CLOSE"), errors="coerce"),
+                    "Traded Qty": pd.to_numeric(col("TTL_TRD_QNTY", "TTL_TRD_QTY"), errors="coerce"),
+                    "Delivery Qty": pd.to_numeric(col("DELIV_QTY"), errors="coerce"),
+                    "Delivery %": pd.to_numeric(col("DELIV_PER"), errors="coerce"),
+                })
+                result.insert(0, "Date", d.strftime("%d-%b-%Y"))
+                result = result.dropna(subset=["Delivery %"])
+
+                avg10 = fetch_delivery_avg_all_symbols(trading_days_needed=10, lookback_days=20)
+                avg10 = avg10.rename(columns={"Avg Delivery %": "10D Avg Delivery %"})
+                avgm = fetch_delivery_avg_all_symbols(trading_days_needed=22, lookback_days=40)
+                avgm = avgm.rename(columns={"Avg Delivery %": "Monthly Avg Delivery %"})
+
+                result = result.merge(avg10, on="Symbol", how="left")
+                result = result.merge(avgm, on="Symbol", how="left")
+                result["10D Avg Delivery %"] = result["10D Avg Delivery %"].round(2)
+                result["Monthly Avg Delivery %"] = result["Monthly Avg Delivery %"].round(2)
+
+                return result.sort_values("Delivery %", ascending=False).reset_index(drop=True)
+        d -= timedelta(days=1)
+        checked += 1
+    return pd.DataFrame(columns=["Date", "Symbol", "Close", "Traded Qty", "Delivery Qty", "Delivery %",
+                                  "10D Avg Delivery %", "Monthly Avg Delivery %"])
+
+
+
+# ============================================================================
 # SECTION 4: reports.py — PDF report generation (extended with new signals)
 # ============================================================================
 
@@ -1621,6 +2023,103 @@ def render_stock_detail(symbol: str):
         fcols[2].metric("Rev. Growth", f"{f.get('revenue_growth_pct'):.1f}%" if f.get("revenue_growth_pct") is not None else "—")
         fcols[3].metric("D/E", f"{f.get('debt_to_equity_val'):.2f}" if f.get("debt_to_equity_val") is not None else "—")
 
+    with st.expander("🏦 Shareholding, Deals & Delivery % (Screener.in + NSE — unofficial, best-effort)"):
+        st.caption(
+            "Promoter/FII/DII/Public holding is scraped from screener.in (simple "
+            "HTML fetch, no bot-protection dance). Bulk/Block deals and Delivery % "
+            "come from nseindia.com via the `nse` package, which can be "
+            "blocked/rate-limited on some hosts — retry if empty."
+        )
+        if not _NSE_LIB_AVAILABLE:
+            st.warning("`nse` package not installed (needed for bulk/block deals & delivery % only). Run: `pip install nse` (and `pip install \"httpx[http2]\"` if deployed on a server/cloud host).")
+
+        debug_mode = st.checkbox("Show debug info (raw response)", key=f"nse_debug_{symbol}")
+
+        if st.button("Fetch shareholding, deals & delivery", key=f"nse_fetch_{symbol}"):
+            with st.spinner("Fetching from screener.in and nseindia.com (delivery % needs a few daily reports, may take a moment)..."):
+                st.session_state[f"nse_data_{symbol}"] = {
+                    "filings": fetch_shareholding_filings(c["symbol"]),
+                    "bulk": fetch_deals(c["symbol"], "bulk", days=90),
+                    "block": fetch_deals(c["symbol"], "block", days=90),
+                    "delivery": fetch_delivery_history(c["symbol"], lookback_days=20, want_rows=10),
+                }
+                if debug_mode:
+                    st.session_state[f"nse_debug_data_{symbol}"] = fetch_nse_debug(c["symbol"])
+
+        if debug_mode and st.session_state.get(f"nse_debug_data_{symbol}"):
+            st.markdown("**Debug — raw responses**")
+            for label, info in st.session_state[f"nse_debug_data_{symbol}"].items():
+                st.markdown(f"`{label}` → status: `{info['status']}`")
+                st.code(info["body"], language="json")
+
+        nse_cached = st.session_state.get(f"nse_data_{symbol}")
+        if nse_cached:
+            st.markdown("**Shareholding Pattern (QoQ) — Promoter / FII / DII / Public**")
+            filings = nse_cached["filings"]
+            if filings:
+                row = filings[0]
+
+                def _trend_row(prefix: str, label: str):
+                    cur = row.get(f"{prefix}_cur")
+                    prev = row.get(f"{prefix}_prev")
+                    chg = row.get(f"{prefix}_chg")
+                    if cur is None:
+                        return None
+                    arrow = "→"
+                    if chg is not None:
+                        arrow = "↑" if chg > 0 else ("↓" if chg < 0 else "→")
+                    return {
+                        "Category": label,
+                        "Current %": cur,
+                        "Previous Qtr %": prev if prev is not None else "—",
+                        "Change": f"{chg:+.2f}%" if chg is not None else "—",
+                        "Trend": arrow,
+                    }
+
+                sh_rows = [r for r in (
+                    _trend_row("promoter", "Promoter"),
+                    _trend_row("fii", "FII / FPI"),
+                    _trend_row("dii", "DII"),
+                    _trend_row("public", "Public"),
+                ) if r is not None]
+
+                if sh_rows:
+                    st.dataframe(pd.DataFrame(sh_rows), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("Shareholding section found but no recognizable Promoter/FII/DII/Public rows.")
+            else:
+                st.caption("No shareholding data returned.")
+
+            st.markdown("**Bulk Deals (last 90 days)**")
+            if nse_cached["bulk"]:
+                st.dataframe(pd.DataFrame(nse_cached["bulk"]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No bulk deals in this period.")
+
+            st.markdown("**Block Deals (last 90 days)**")
+            if nse_cached["block"]:
+                st.dataframe(pd.DataFrame(nse_cached["block"]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No block deals in this period.")
+
+            st.markdown("**Delivery % (last 10 trading days)**")
+            delivery_rows = nse_cached.get("delivery") or []
+            if delivery_rows:
+                dd = pd.DataFrame(delivery_rows)
+                st.dataframe(dd, use_container_width=True, hide_index=True)
+                try:
+                    latest_pct = float(dd.iloc[0]["Delivery %"])
+                    avg_pct = pd.to_numeric(dd["Delivery %"], errors="coerce").mean()
+                    dcol1, dcol2 = st.columns(2)
+                    dcol1.metric("Latest Delivery %", f"{latest_pct:.1f}%")
+                    dcol2.metric(f"Avg over {len(dd)} sessions", f"{avg_pct:.1f}%",
+                                 delta=f"{latest_pct - avg_pct:+.1f}%")
+                except Exception:
+                    pass
+                st.caption("Higher delivery % generally means more genuine (non-intraday) buying/selling interest, not just trading churn.")
+            else:
+                st.caption("No delivery data returned (report may not be published yet for recent sessions, or symbol/series mismatch).")
+
     st.markdown("#### 📝 Your Notes")
     note_val = st.text_area("Notes", value=get_note(symbol), key=f"note_{symbol}", label_visibility="collapsed")
     if st.button("Save note", key=f"savenote_{symbol}"):
@@ -1631,7 +2130,14 @@ def render_stock_detail(symbol: str):
 # ---------------------------- Sidebar navigation -----------------------
 st.sidebar.title("📈 Stocks With Laxman")
 st.sidebar.caption("Unified Engine — merged from both scanners")
-page = st.sidebar.radio("Navigate", ["🔍 Scanner", "⭐ Watchlist", "🧮 Position Sizing", "ℹ️ About"], label_visibility="collapsed")
+
+# Apply any programmatic "jump to page X" request queued by a button elsewhere
+# in the app. This MUST run before the radio widget below is instantiated —
+# Streamlit forbids writing to a widget-bound session_state key afterward.
+if "_pending_nav" in st.session_state:
+    st.session_state["nav_page"] = st.session_state.pop("_pending_nav")
+
+page = st.sidebar.radio("Navigate", ["🔍 Scanner", "⭐ Watchlist", "📢 Bulk/Block Deals", "🧮 Position Sizing", "ℹ️ About"], label_visibility="collapsed", key="nav_page")
 
 st.sidebar.markdown("---")
 
@@ -1659,7 +2165,7 @@ if lookup.strip():
         for s in suggestions:
             if st.sidebar.button(s, key=f"suggest_{s}", use_container_width=True):
                 st.session_state.selected_symbol = f"{s}.NS"
-                page = "🔍 Scanner"
+                st.session_state["_pending_nav"] = "🔍 Scanner"
                 st.rerun()
     else:
         st.sidebar.caption("No matching symbols found.")
@@ -1827,7 +2333,142 @@ elif page == "⭐ Watchlist":
         st.markdown("---")
         render_stock_detail(st.session_state.selected_symbol)
 
-# ============================== POSITION SIZING PAGE =====================
+# ============================== BULK/BLOCK DEALS PAGE =====================
+elif page == "📢 Bulk/Block Deals":
+    st.title("Bulk & Block Deals / Delivery % — Last N Days")
+    st.caption(
+        "All bulk/block deals reported on NSE across every stock (not just your "
+        "scan universe), via the `nse` package. Large trades here can hint at "
+        "institutional accumulation or exit — cross-check before acting. Switch "
+        "'Deal type' to Best Delivery % for a market-wide delivery leaderboard."
+    )
+
+    if not _NSE_LIB_AVAILABLE:
+        st.warning("`nse` package not installed. Run: `pip install nse` (and `pip install \"httpx[http2]\"` if deployed on a server/cloud host).")
+    else:
+        fc1, fc2, fc3 = st.columns([1, 1, 2])
+        days_back = fc1.selectbox("Period", [7, 15, 30, 60, 90, 180, 365], index=4, key="deals_days")
+        deal_kind = fc2.selectbox("Deal type", ["Both", "Bulk only", "Block only", "Best Delivery %"], key="deals_kind")
+        search_symbol = fc3.text_input("Filter by symbol (optional)", placeholder="e.g. RELIANCE", key="deals_search")
+
+        min_qty = 0
+        min_delivery_pct = 0
+        if deal_kind == "Best Delivery %":
+            dq1, dq2 = st.columns(2)
+            min_qty = dq1.number_input(
+                "Min traded qty (filters out illiquid stocks with misleading 100% delivery)",
+                min_value=0, value=10000, step=5000, key="deals_min_qty",
+            )
+            min_delivery_pct = dq2.number_input(
+                "Min Delivery % (e.g. 55 = only show stocks with 55%+ delivery)",
+                min_value=0.0, max_value=100.0, value=55.0, step=5.0, key="deals_min_delivery_pct",
+            )
+
+        if st.button("🔄 Fetch deals", type="primary", key="fetch_all_deals_btn"):
+            if deal_kind == "Best Delivery %":
+                with st.spinner("Fetching latest NSE delivery report + 10-day/monthly averages (downloads up to ~40 daily reports the first time — later reruns reuse the cache and are much faster)..."):
+                    st.session_state["all_deals_df"] = fetch_market_delivery_leaderboard(lookback_days=days_back)
+                    st.session_state["all_deals_mode"] = "delivery"
+            else:
+                with st.spinner(f"Fetching bulk/block deals for the last {days_back} days (in date chunks to avoid NSE truncation — may take a bit longer)..."):
+                    frames = []
+                    if deal_kind in ("Both", "Bulk only"):
+                        bdf = fetch_all_deals("bulk", days_back)
+                        if not bdf.empty:
+                            bdf.insert(1, "Type", "Bulk")
+                            frames.append(bdf)
+                    if deal_kind in ("Both", "Block only"):
+                        kdf = fetch_all_deals("block", days_back)
+                        if not kdf.empty:
+                            kdf.insert(1, "Type", "Block")
+                            frames.append(kdf)
+                    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+                        columns=["Date", "Type", "Symbol", "Security", "Client", "Buy/Sell", "Qty", "Price"]
+                    )
+                    st.session_state["all_deals_df"] = combined
+                    st.session_state["all_deals_mode"] = "deals"
+
+        all_deals_df = st.session_state.get("all_deals_df")
+        all_deals_mode = st.session_state.get("all_deals_mode", "deals")
+
+        if all_deals_df is not None:
+            display_df = all_deals_df.copy()
+            if search_symbol.strip():
+                q = search_symbol.strip().upper()
+                display_df = display_df[display_df["Symbol"].astype(str).str.upper().str.contains(q, na=False)]
+
+            if all_deals_mode == "delivery" and min_qty:
+                display_df = display_df[display_df["Traded Qty"].fillna(0) >= min_qty]
+
+            if all_deals_mode == "delivery" and min_delivery_pct:
+                display_df = display_df[display_df["Delivery %"].fillna(0) >= min_delivery_pct]
+
+            if display_df.empty:
+                st.info("No data found for this period/filter.")
+            elif all_deals_mode == "delivery":
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Stocks with data", len(display_df))
+                m2.metric("Avg Delivery %", f"{display_df['Delivery %'].mean():.1f}%")
+                m3.metric("Max Delivery %", f"{display_df['Delivery %'].max():.1f}%")
+
+                st.markdown("#### 🏆 Best delivery stocks (highest Delivery %)")
+                top_counts = display_df.head(15)
+                st.dataframe(top_counts, use_container_width=True, hide_index=True)
+
+                st.markdown("#### All stocks (sorted by Delivery %)")
+                sort_df = display_df.sort_values("Delivery %", ascending=False)
+                st.dataframe(sort_df, use_container_width=True, hide_index=True, height=420)
+
+                csv_bytes = sort_df.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Download as CSV", csv_bytes, file_name="best_delivery_stocks.csv", mime="text/csv")
+
+                st.caption("Tap a symbol below to jump to its full scan/detail view (technical + fundamental + shareholding).")
+                unique_syms = sort_df["Symbol"].dropna().unique().tolist()
+                pick_cols = st.columns(6)
+                for i, sym in enumerate(unique_syms[:24]):
+                    if pick_cols[i % 6].button(sym, key=f"deal_view_{sym}", use_container_width=True):
+                        st.session_state.selected_symbol = f"{sym}.NS"
+                        st.session_state["_pending_nav"] = "🔍 Scanner"
+                        st.rerun()
+                if len(unique_syms) > 24:
+                    st.caption(f"...and {len(unique_syms) - 24} more (use the symbol filter above to narrow down).")
+            else:
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Total deals", len(display_df))
+                m2.metric("Unique stocks", display_df["Symbol"].nunique())
+                m3.metric("Buy vs Sell", f"{(display_df['Buy/Sell'].astype(str).str.upper() == 'BUY').sum()} / {(display_df['Buy/Sell'].astype(str).str.upper() == 'SELL').sum()}")
+
+                st.markdown("#### Most active stocks (by number of deals)")
+                top_counts = (
+                    display_df.groupby("Symbol")
+                    .size()
+                    .reset_index(name="Deal Count")
+                    .sort_values("Deal Count", ascending=False)
+                    .head(15)
+                )
+                st.dataframe(top_counts, use_container_width=True, hide_index=True)
+
+                st.markdown("#### All deals")
+                sort_df = display_df.sort_values("Date", ascending=False)
+                st.dataframe(sort_df, use_container_width=True, hide_index=True, height=420)
+
+                csv_bytes = sort_df.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Download as CSV", csv_bytes, file_name=f"bulk_block_deals_{days_back}d.csv", mime="text/csv")
+
+                st.caption("Tap a symbol below to jump to its full scan/detail view (technical + fundamental + shareholding).")
+                unique_syms = sorted(display_df["Symbol"].dropna().unique().tolist())
+                pick_cols = st.columns(6)
+                for i, sym in enumerate(unique_syms[:24]):
+                    if pick_cols[i % 6].button(sym, key=f"deal_view_{sym}", use_container_width=True):
+                        st.session_state.selected_symbol = f"{sym}.NS"
+                        st.session_state["_pending_nav"] = "🔍 Scanner"
+                        st.rerun()
+                if len(unique_syms) > 24:
+                    st.caption(f"...and {len(unique_syms) - 24} more (use the symbol filter above to narrow down).")
+        else:
+            st.info("Click **Fetch deals** to load data for the selected period.")
+
+
 elif page == "🧮 Position Sizing":
     st.title("Position Sizing Calculator")
     st.caption("Work out how many shares to buy given your account size and risk tolerance.")
