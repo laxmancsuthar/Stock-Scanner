@@ -1069,14 +1069,12 @@ def fetch_nse_debug(symbol: str) -> Dict[str, Any]:
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
-def fetch_shareholding_filings(symbol: str) -> List[Dict[str, Any]]:
-    """Promoter / FII / DII / Public shareholding (current, previous quarter,
-    QoQ change) scraped from screener.in's company page. This is a different,
-    more reliable source than NSE's JSON API — no cookie/bot-protection dance,
-    single HTML request, and screener already lines up quarter-over-quarter
-    columns so the change % can be computed directly.
-    Returns a single-row list (easiest to render as a table) with keys like
-    promoter_cur/promoter_prev/promoter_chg, fii_*, dii_*, public_*."""
+def _fetch_screener_soup(symbol: str) -> Optional[str]:
+    """Fetch screener.in's company page HTML once per symbol (cached), reused
+    by shareholding, quarterly/annual financials, etc. — avoids re-downloading
+    the same page for every feature that needs it. Returns raw HTML text
+    (BeautifulSoup objects aren't cache-friendly/picklable) — callers should
+    parse it with BeautifulSoup themselves."""
     base = symbol.replace(".NS", "")
     session = requests.Session()
     session.headers.update({
@@ -1085,33 +1083,33 @@ def fetch_shareholding_filings(symbol: str) -> List[Dict[str, Any]]:
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.screener.in/",
     })
-
-    soup = None
     for url in (f"https://www.screener.in/company/{base}/consolidated/",
                 f"https://www.screener.in/company/{base}/"):
         try:
             resp = session.get(url, timeout=12)
             if resp.status_code == 200:
-                try:
-                    soup = BeautifulSoup(resp.text, "lxml")
-                except Exception:
-                    soup = BeautifulSoup(resp.text, "html.parser")
-                break
+                return resp.text
         except Exception:
             continue
+    return None
 
-    if soup is None:
-        return []
 
-    sh_section = soup.find("section", {"id": "shareholding"})
-    if not sh_section:
-        return []
-    table = sh_section.find("table")
+def _parse_screener_table(html: str, section_id: str) -> Dict[str, List[Optional[float]]]:
+    """Parse one screener.in table section (by section id, e.g. 'quarters',
+    'profit-loss', 'cash-flow', 'shareholding') into {row_label: [values...]},
+    left-to-right = oldest to most recent period, matching screener's layout."""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+    section = soup.find("section", {"id": section_id})
+    if not section:
+        return {}
+    table = section.find("table")
     if not table:
-        return []
-
+        return {}
     rows = table.find_all("tr")
-    sh_data: Dict[str, List[Optional[float]]] = {}
+    data: Dict[str, List[Optional[float]]] = {}
     for i, row in enumerate(rows):
         cols = row.find_all(["th", "td"])
         texts = [c.get_text(strip=True).replace("%", "").replace(",", "") for c in cols]
@@ -1122,19 +1120,38 @@ def fetch_shareholding_filings(symbol: str) -> List[Dict[str, Any]]:
             vals = [float(v) if v not in ("", "-", "--") else None for v in texts[1:]]
         except Exception:
             vals = [None] * len(texts[1:])
-        sh_data[label] = vals
+        data[label] = vals
+    return data
 
-    def get_sh(keys: List[str]) -> Optional[List[Optional[float]]]:
-        for k in keys:
-            for label, vals in sh_data.items():
-                if k.lower() in label.lower():
-                    return vals
-        return None
+
+def _get_table_row(table_data: Dict[str, List[Optional[float]]], keys: List[str]) -> Optional[List[Optional[float]]]:
+    for k in keys:
+        for label, vals in table_data.items():
+            if k.lower() in label.lower():
+                return vals
+    return None
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def fetch_shareholding_filings(symbol: str) -> List[Dict[str, Any]]:
+    """Promoter / FII / DII / Public shareholding (current, previous quarter,
+    QoQ change) scraped from screener.in's company page. This is a different,
+    more reliable source than NSE's JSON API — no cookie/bot-protection dance,
+    single HTML request, and screener already lines up quarter-over-quarter
+    columns so the change % can be computed directly.
+    Returns a single-row list (easiest to render as a table) with keys like
+    promoter_cur/promoter_prev/promoter_chg, fii_*, dii_*, public_*."""
+    html = _fetch_screener_soup(symbol)
+    if html is None:
+        return []
+    sh_data = _parse_screener_table(html, "shareholding")
+    if not sh_data:
+        return []
 
     result: Dict[str, Any] = {}
 
     def fill(prefix: str, keys: List[str]):
-        vals = get_sh(keys)
+        vals = _get_table_row(sh_data, keys)
         if vals and len(vals) >= 1 and vals[-1] is not None:
             result[f"{prefix}_cur"] = round(vals[-1], 2)
             if len(vals) >= 2 and vals[-2] is not None:
@@ -1147,6 +1164,67 @@ def fetch_shareholding_filings(symbol: str) -> List[Dict[str, Any]]:
     fill("public", ["Public"])
 
     return [result] if result else []
+
+
+# Row label -> keys used to find it on screener.in's quarterly/annual/cash-flow
+# tables. "Net Profit" and "PAT" are the same screener row (Indian filings use
+# the terms interchangeably) — both are shown since the user wants both
+# labels, but they'll always carry identical values.
+_FIN_METRIC_KEYS: Dict[str, List[str]] = {
+    "EPS": ["EPS in Rs", "EPS"],
+    "OPM": ["OPM"],
+    "Sales Growth": ["Sales", "Revenue"],
+    "PAT": ["Net Profit", "Profit after tax"],
+    "PBT": ["Profit before tax"],
+    "EBITDA": ["Operating Profit"],
+    "NET PROFIT": ["Net Profit", "Profit after tax"],
+    "CASH FLOW": ["Cash from Operating Activity", "Net Cash Flow"],
+}
+# OPM is already a percentage/ratio — QoQ/YoY "growth" for it is shown as a
+# percentage-POINT delta (e.g. "+2.1 pts"), not a relative % change, since
+# relative-% of a percentage is misleading. Everything else is a relative %.
+_FIN_METRIC_IS_MARGIN = {"OPM"}
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def fetch_quarterly_yearly_financials(symbol: str) -> Dict[str, Dict[str, Optional[float]]]:
+    """EPS / OPM / Sales Growth / PAT / PBT / EBITDA / Net Profit / Cash Flow —
+    QoQ (from screener's 'quarters' table) and YoY (from the annual
+    'profit-loss' + 'cash-flow' tables) change, for one symbol.
+    Cash Flow only exists as an annual figure on screener.in, so its QoQ is
+    always None (shown as '—' in the UI).
+    Returns {metric_label: {"qoq": float|None, "yoy": float|None}}."""
+    html = _fetch_screener_soup(symbol)
+    if html is None:
+        return {}
+
+    q_data = _parse_screener_table(html, "quarters")
+    a_data = _parse_screener_table(html, "profit-loss")
+    cf_data = _parse_screener_table(html, "cash-flow")
+
+    def pct_change(vals: Optional[List[Optional[float]]], is_margin: bool) -> Optional[float]:
+        if not vals or len(vals) < 2:
+            return None
+        last, prev = vals[-1], vals[-2]
+        if last is None or prev is None:
+            return None
+        if is_margin:
+            return round(last - prev, 2)  # percentage-point delta
+        if prev == 0:
+            return None
+        return round(((last - prev) / abs(prev)) * 100, 1)
+
+    out: Dict[str, Dict[str, Optional[float]]] = {}
+    for label, keys in _FIN_METRIC_KEYS.items():
+        is_margin = label in _FIN_METRIC_IS_MARGIN
+        if label == "CASH FLOW":
+            qoq = None  # not published quarterly on screener.in
+            yoy = pct_change(_get_table_row(cf_data, keys), is_margin)
+        else:
+            qoq = pct_change(_get_table_row(q_data, keys), is_margin)
+            yoy = pct_change(_get_table_row(a_data, keys), is_margin)
+        out[label] = {"qoq": qoq, "yoy": yoy}
+    return out
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 30)
@@ -1286,7 +1364,11 @@ def fetch_delivery_history(symbol: str, lookback_days: int = 20, want_rows: int 
                     def g(*names):
                         for n in names:
                             if n in match.columns:
-                                return r[n]
+                                val = r[n]
+                                try:
+                                    return float(val)
+                                except (TypeError, ValueError):
+                                    return None
                         return None
 
                     out.append({
@@ -1567,6 +1649,29 @@ def _kv_grid(rows, col_width):
     return tbl
 
 
+def _data_table(headers, rows, col_widths):
+    """Header row + data rows table, styled consistently with the rest of the
+    PDF (used for the QoQ/YoY financials table and the shareholding table)."""
+    styles = getSampleStyleSheet()
+    hdr_style = ParagraphStyle("TblHdr", parent=styles["BodyText"], fontSize=8, leading=11,
+                                textColor=colors.HexColor(PDF_MUTED), fontName="Helvetica-Bold")
+    cell_style = ParagraphStyle("TblCell", parent=styles["BodyText"], fontSize=8.5, leading=12,
+                                 textColor=colors.HexColor(PDF_TEXT))
+    data = [[Paragraph(h, hdr_style) for h in headers]]
+    for row in rows:
+        data.append([Paragraph(str(v), cell_style) for v in row])
+    tbl = Table(data, colWidths=col_widths)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(PDF_CARD)),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.75, colors.HexColor(PDF_BORDER)),
+        ("LINEBELOW", (0, 1), (-1, -1), 0.4, colors.HexColor(PDF_BORDER)),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    return tbl
+
+
 def build_stock_report(candidate: dict) -> bytes:
     buf = BytesIO()
     doc = SimpleDocTemplate(
@@ -1743,19 +1848,106 @@ def build_stock_report(candidate: dict) -> bytes:
     story.append(Spacer(1, 12))
 
     # ---------------------------------------------------------------
-    # Fundamental snapshot (mirrors the "Fundamental snapshot" expander)
+    # Fundamental snapshot — QoQ/YoY financials (mirrors the on-screen
+    # "Fundamental snapshot" expander)
     # ---------------------------------------------------------------
-    f = candidate.get("fundamentals", {}) or {}
-    story.append(Paragraph("Fundamental Snapshot", h2))
-    story.append(_metric_row(
-        [
-            ("ROE", _fmt(f.get("roe_pct"), "", "%", 1)),
-            ("PE", _fmt(f.get("pe"), decimals=1)),
-            ("Rev. Growth", _fmt(f.get("revenue_growth_pct"), "", "%", 1)),
-            ("D/E", _fmt(f.get("debt_to_equity_val"), decimals=2)),
-        ],
-        content_w / 4,
-    ))
+    story.append(Paragraph("Fundamental Snapshot — QoQ / YoY", h2))
+    fin_data = fetch_quarterly_yearly_financials(candidate.get("symbol", ""))
+    if fin_data:
+        fin_rows = []
+        for label in ["EPS", "OPM", "Sales Growth", "PAT", "PBT", "EBITDA", "NET PROFIT", "CASH FLOW"]:
+            m = fin_data.get(label, {})
+            qoq, yoy = m.get("qoq"), m.get("yoy")
+            unit = " pts" if label in _FIN_METRIC_IS_MARGIN else "%"
+            fin_rows.append([
+                label,
+                f"{qoq:+.1f}{unit}" if qoq is not None else "—",
+                f"{yoy:+.1f}{unit}" if yoy is not None else "—",
+            ])
+        story.append(_data_table(["Metric", "QoQ", "YoY"], fin_rows, [content_w * 0.5, content_w * 0.25, content_w * 0.25]))
+    else:
+        story.append(Paragraph("No financial data available from screener.in for this stock.", muted_italic))
+    story.append(Spacer(1, 14))
+
+    # ---------------------------------------------------------------
+    # Shareholding Pattern + Delivery % (mirrors the on-screen
+    # "Shareholding & Delivery %" expander)
+    # ---------------------------------------------------------------
+    story.append(Paragraph("Shareholding Pattern (QoQ) — Promoter / FII / DII / Public", h2))
+    filings = fetch_shareholding_filings(candidate.get("symbol", ""))
+    if filings:
+        srow = filings[0]
+
+        def _sh_row(prefix, label):
+            cur = srow.get(f"{prefix}_cur")
+            prev = srow.get(f"{prefix}_prev")
+            chg = srow.get(f"{prefix}_chg")
+            if cur is None:
+                return None
+            arrow = "→"
+            if chg is not None:
+                arrow = "↑" if chg > 0 else ("↓" if chg < 0 else "→")
+            return [label, f"{cur:.2f}%", f"{prev:.2f}%" if prev is not None else "—",
+                    f"{chg:+.2f}%" if chg is not None else "—", arrow]
+
+        sh_table_rows = [r for r in (
+            _sh_row("promoter", "Promoter"), _sh_row("fii", "FII / FPI"),
+            _sh_row("dii", "DII"), _sh_row("public", "Public"),
+        ) if r is not None]
+        if sh_table_rows:
+            story.append(_data_table(
+                ["Category", "Current %", "Previous Qtr %", "Change", "Trend"], sh_table_rows,
+                [content_w * 0.25, content_w * 0.2, content_w * 0.22, content_w * 0.18, content_w * 0.15],
+            ))
+        else:
+            story.append(Paragraph("Shareholding section found but no recognizable rows.", muted_italic))
+    else:
+        story.append(Paragraph("No shareholding data available from screener.in for this stock.", muted_italic))
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph("Delivery %", h2))
+    delivery_rows = fetch_delivery_history(candidate.get("symbol", ""), lookback_days=20, want_rows=10)
+    if delivery_rows:
+        latest_pct = delivery_rows[0].get("Delivery %")
+        try:
+            latest_pct = float(latest_pct) if latest_pct is not None else None
+        except (TypeError, ValueError):
+            latest_pct = None
+        base_sym = candidate.get("symbol", "").replace(".NS", "").strip().upper()
+        avg10_df = fetch_delivery_avg_all_symbols(trading_days_needed=10, lookback_days=20)
+        avg10_row = avg10_df[avg10_df["Symbol"].astype(str).str.strip().str.upper() == base_sym]
+        avg10_pct = float(avg10_row["Avg Delivery %"].iloc[0]) if not avg10_row.empty else None
+        avgm_df = fetch_delivery_avg_all_symbols(trading_days_needed=22, lookback_days=40)
+        avgm_row = avgm_df[avgm_df["Symbol"].astype(str).str.strip().str.upper() == base_sym]
+        avgm_pct = float(avgm_row["Avg Delivery %"].iloc[0]) if not avgm_row.empty else None
+
+        def _delta_suffix(base, ref):
+            if base is None or ref is None:
+                return ""
+            d = base - ref
+            sign = "+" if d >= 0 else ""
+            return f"  ({sign}{d:.1f}%)"
+
+        value_colors = {}
+        pairs = [("Latest Delivery %", _fmt(latest_pct, "", "%", 1))]
+
+        if avg10_pct is not None:
+            pairs.append(("Last 10-Day Avg", _fmt(avg10_pct, "", "%", 1) + _delta_suffix(latest_pct, avg10_pct)))
+            if latest_pct is not None:
+                value_colors[1] = PDF_GREEN if latest_pct >= avg10_pct else PDF_RED
+        else:
+            pairs.append(("Last 10-Day Avg", "—"))
+
+        if avgm_pct is not None:
+            pairs.append(("Last Month Avg", _fmt(avgm_pct, "", "%", 1) + _delta_suffix(latest_pct, avgm_pct)))
+            if latest_pct is not None:
+                value_colors[2] = PDF_GREEN if latest_pct >= avgm_pct else PDF_RED
+        else:
+            pairs.append(("Last Month Avg", "—"))
+
+        story.append(_metric_row(pairs, content_w / 3, value_colors=value_colors, value_size=11))
+    else:
+        story.append(Paragraph("No delivery data available for this stock.", muted_italic))
     story.append(Spacer(1, 14))
 
     story.append(Paragraph(
@@ -1971,12 +2163,16 @@ def render_stock_detail(symbol: str):
             add_to_watchlist(c["symbol"], c["name"])
             st.success("Added to watchlist")
     with b2:
-        pdf_bytes = build_stock_report(c)
-        st.download_button(
-            "📄 Download PDF Report", data=pdf_bytes,
-            file_name=f"{c['base_symbol']}_swing_report.pdf", mime="application/pdf",
-            key=f"pdf_{symbol}", use_container_width=True,
-        )
+        if st.button("📄 Prepare PDF Report", key=f"pdfgen_{symbol}", use_container_width=True):
+            with st.spinner("Building PDF (includes shareholding/financials/delivery — first time per stock takes a moment)..."):
+                st.session_state[f"pdf_bytes_{symbol}"] = build_stock_report(c)
+        pdf_bytes = st.session_state.get(f"pdf_bytes_{symbol}")
+        if pdf_bytes:
+            st.download_button(
+                "⬇️ Download PDF Report", data=pdf_bytes,
+                file_name=f"{c['base_symbol']}_swing_report.pdf", mime="application/pdf",
+                key=f"pdf_{symbol}", use_container_width=True,
+            )
 
     st.plotly_chart(build_price_chart(t, c["base_symbol"]), use_container_width=True)
 
@@ -2016,43 +2212,56 @@ def render_stock_detail(symbol: str):
         c3c.write(f"**Volume ratio:** {t.get('volume_ratio'):.2f}x")
 
     with st.expander("Fundamental snapshot"):
-        f = c["fundamentals"]
-        fcols = st.columns(4)
-        fcols[0].metric("ROE", f"{f.get('roe_pct'):.1f}%" if f.get("roe_pct") is not None else "—")
-        fcols[1].metric("PE", f"{f.get('pe'):.1f}" if f.get("pe") is not None else "—")
-        fcols[2].metric("Rev. Growth", f"{f.get('revenue_growth_pct'):.1f}%" if f.get("revenue_growth_pct") is not None else "—")
-        fcols[3].metric("D/E", f"{f.get('debt_to_equity_val'):.2f}" if f.get("debt_to_equity_val") is not None else "—")
+        fin_col1, fin_col2 = st.columns([5, 1])
+        fin_col1.caption("Auto-loads from screener.in (cached ~6 hours — repeat views are instant).")
+        if fin_col2.button("🔄", key=f"fin_refresh_{symbol}", help="Force refresh (clears cached data for all stocks, not just this one)"):
+            fetch_quarterly_yearly_financials.clear()
 
-    with st.expander("🏦 Shareholding, Deals & Delivery % (Screener.in + NSE — unofficial, best-effort)"):
+        with st.spinner("Fetching quarterly/annual financials from screener.in..."):
+            fin_data = fetch_quarterly_yearly_financials(c["symbol"])
+
+        if fin_data:
+            fin_rows = []
+            for label in ["EPS", "OPM", "Sales Growth", "PAT", "PBT", "EBITDA", "NET PROFIT", "CASH FLOW"]:
+                m = fin_data.get(label, {})
+                qoq, yoy = m.get("qoq"), m.get("yoy")
+                unit = " pts" if label in _FIN_METRIC_IS_MARGIN else "%"
+                fin_rows.append({
+                    "Metric": label,
+                    "QoQ": f"{qoq:+.1f}{unit}" if qoq is not None else "—",
+                    "YoY": f"{yoy:+.1f}{unit}" if yoy is not None else "—",
+                })
+            st.dataframe(pd.DataFrame(fin_rows), use_container_width=True, hide_index=True)
+            st.caption(
+                "PAT and Net Profit are the same screener.in line item (shown as separate "
+                "rows since both were requested). Cash Flow is only published annually on "
+                "screener.in, so its QoQ is always '—'."
+            )
+        else:
+            st.caption("No financial data returned from screener.in for this stock.")
+
+    with st.expander("🏦 Shareholding & Delivery % (Screener.in + NSE — unofficial, best-effort)"):
         st.caption(
             "Promoter/FII/DII/Public holding is scraped from screener.in (simple "
-            "HTML fetch, no bot-protection dance). Bulk/Block deals and Delivery % "
-            "come from nseindia.com via the `nse` package, which can be "
-            "blocked/rate-limited on some hosts — retry if empty."
+            "HTML fetch, no bot-protection dance). Delivery % comes from "
+            "nseindia.com via the `nse` package, which can be blocked/rate-limited "
+            "on some hosts — retry if empty."
         )
         if not _NSE_LIB_AVAILABLE:
-            st.warning("`nse` package not installed (needed for bulk/block deals & delivery % only). Run: `pip install nse` (and `pip install \"httpx[http2]\"` if deployed on a server/cloud host).")
+            st.warning("`nse` package not installed (needed for delivery % only). Run: `pip install nse` (and `pip install \"httpx[http2]\"` if deployed on a server/cloud host).")
 
-        debug_mode = st.checkbox("Show debug info (raw response)", key=f"nse_debug_{symbol}")
+        nse_col1, nse_col2 = st.columns([5, 1])
+        nse_col1.caption("Auto-loads (cached ~6 hours — repeat views are instant; delivery % first-load can take a moment).")
+        if nse_col2.button("🔄", key=f"nse_refresh_{symbol}", help="Force refresh (clears cached data for all stocks, not just this one)"):
+            fetch_shareholding_filings.clear()
+            fetch_delivery_history.clear()
 
-        if st.button("Fetch shareholding, deals & delivery", key=f"nse_fetch_{symbol}"):
-            with st.spinner("Fetching from screener.in and nseindia.com (delivery % needs a few daily reports, may take a moment)..."):
-                st.session_state[f"nse_data_{symbol}"] = {
-                    "filings": fetch_shareholding_filings(c["symbol"]),
-                    "bulk": fetch_deals(c["symbol"], "bulk", days=90),
-                    "block": fetch_deals(c["symbol"], "block", days=90),
-                    "delivery": fetch_delivery_history(c["symbol"], lookback_days=20, want_rows=10),
-                }
-                if debug_mode:
-                    st.session_state[f"nse_debug_data_{symbol}"] = fetch_nse_debug(c["symbol"])
+        with st.spinner("Fetching from screener.in and nseindia.com (delivery % needs a few daily reports, may take a moment)..."):
+            nse_cached = {
+                "filings": fetch_shareholding_filings(c["symbol"]),
+                "delivery": fetch_delivery_history(c["symbol"], lookback_days=20, want_rows=10),
+            }
 
-        if debug_mode and st.session_state.get(f"nse_debug_data_{symbol}"):
-            st.markdown("**Debug — raw responses**")
-            for label, info in st.session_state[f"nse_debug_data_{symbol}"].items():
-                st.markdown(f"`{label}` → status: `{info['status']}`")
-                st.code(info["body"], language="json")
-
-        nse_cached = st.session_state.get(f"nse_data_{symbol}")
         if nse_cached:
             st.markdown("**Shareholding Pattern (QoQ) — Promoter / FII / DII / Public**")
             filings = nse_cached["filings"]
@@ -2090,18 +2299,6 @@ def render_stock_detail(symbol: str):
             else:
                 st.caption("No shareholding data returned.")
 
-            st.markdown("**Bulk Deals (last 90 days)**")
-            if nse_cached["bulk"]:
-                st.dataframe(pd.DataFrame(nse_cached["bulk"]), use_container_width=True, hide_index=True)
-            else:
-                st.caption("No bulk deals in this period.")
-
-            st.markdown("**Block Deals (last 90 days)**")
-            if nse_cached["block"]:
-                st.dataframe(pd.DataFrame(nse_cached["block"]), use_container_width=True, hide_index=True)
-            else:
-                st.caption("No block deals in this period.")
-
             st.markdown("**Delivery % (last 10 trading days)**")
             delivery_rows = nse_cached.get("delivery") or []
             if delivery_rows:
@@ -2109,11 +2306,26 @@ def render_stock_detail(symbol: str):
                 st.dataframe(dd, use_container_width=True, hide_index=True)
                 try:
                     latest_pct = float(dd.iloc[0]["Delivery %"])
-                    avg_pct = pd.to_numeric(dd["Delivery %"], errors="coerce").mean()
-                    dcol1, dcol2 = st.columns(2)
+                    base_sym = c["symbol"].replace(".NS", "").strip().upper()
+
+                    avg10_df = fetch_delivery_avg_all_symbols(trading_days_needed=10, lookback_days=20)
+                    avg10_row = avg10_df[avg10_df["Symbol"].astype(str).str.strip().str.upper() == base_sym]
+                    avg10_pct = float(avg10_row["Avg Delivery %"].iloc[0]) if not avg10_row.empty else None
+
+                    avgm_df = fetch_delivery_avg_all_symbols(trading_days_needed=22, lookback_days=40)
+                    avgm_row = avgm_df[avgm_df["Symbol"].astype(str).str.strip().str.upper() == base_sym]
+                    avgm_pct = float(avgm_row["Avg Delivery %"].iloc[0]) if not avgm_row.empty else None
+
+                    dcol1, dcol2, dcol3 = st.columns(3)
                     dcol1.metric("Latest Delivery %", f"{latest_pct:.1f}%")
-                    dcol2.metric(f"Avg over {len(dd)} sessions", f"{avg_pct:.1f}%",
-                                 delta=f"{latest_pct - avg_pct:+.1f}%")
+                    if avg10_pct is not None:
+                        dcol2.metric("Last 10-Day Avg", f"{avg10_pct:.1f}%", delta=f"{latest_pct - avg10_pct:+.1f}%")
+                    else:
+                        dcol2.metric("Last 10-Day Avg", "—")
+                    if avgm_pct is not None:
+                        dcol3.metric("Last Month Avg", f"{avgm_pct:.1f}%", delta=f"{latest_pct - avgm_pct:+.1f}%")
+                    else:
+                        dcol3.metric("Last Month Avg", "—")
                 except Exception:
                     pass
                 st.caption("Higher delivery % generally means more genuine (non-intraday) buying/selling interest, not just trading churn.")
