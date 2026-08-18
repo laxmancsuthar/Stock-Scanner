@@ -23,12 +23,13 @@ from __future__ import annotations
 
 import json
 import io
+import calendar
 import tempfile
 import threading
 import time as _time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -209,6 +210,231 @@ def get_universe_live(choice: str) -> Optional[List[str]]:
         return _add_suffix(symbols)
     except Exception:
         return None
+
+
+# ============================================================================
+# SECTION 1B: SEASONAL DATE-RANGE SCAN  (ported from seasonal_stock_scanner.py)
+# ----------------------------------------------------------------------------
+# Diya gaya date-range (sirf din-mahina, saal ignore) pichhle N saal me
+# scan karta hai aur batata hai ki us range me har saal kitni baar profit
+# mila (Accuracy % / win-rate) — Position Sizing page ki jagah naya button.
+#
+# Historical data daily change nahi hota, isliye ye disk par persist hota
+# hai (price_cache/ folder) — ek baar fetch hone ke baad dobara scan karne
+# par yfinance ko call nahi karna padta. Cache 30 din se purana ho jaye to
+# khud-b-khud refresh ho jata hai; ya "🔄 Refresh All Cached Data" button se
+# manually kabhi bhi poora cache force-refresh kiya ja sakta hai.
+# ============================================================================
+
+SEASONAL_CACHE_DIR = Path(__file__).resolve().parent / "price_cache"
+SEASONAL_CACHE_DIR.mkdir(exist_ok=True)
+SEASONAL_CACHE_MAX_AGE_DAYS = 30
+
+
+def _seasonal_cache_path(ticker: str) -> Path:
+    return SEASONAL_CACHE_DIR / f"{ticker.replace('.', '_')}.csv"
+
+
+def _seasonal_load_cache(ticker: str) -> Optional[pd.DataFrame]:
+    p = _seasonal_cache_path(ticker)
+    if not p.exists():
+        return None
+    try:
+        df = pd.read_csv(p, index_col=0, parse_dates=True)
+        if "Close" not in df.columns or df.empty:
+            return None
+        return df
+    except Exception:
+        return None
+
+
+def _seasonal_save_cache(ticker: str, df: pd.DataFrame) -> None:
+    try:
+        df[["Close"]].to_csv(_seasonal_cache_path(ticker))
+    except Exception:
+        pass
+
+
+def _seasonal_cache_age_days(ticker: str) -> float:
+    p = _seasonal_cache_path(ticker)
+    if not p.exists():
+        return float("inf")
+    return (_time.time() - p.stat().st_mtime) / 86400.0
+
+
+def _seasonal_download_fresh(ticker: str, years_back: int) -> Optional[pd.DataFrame]:
+    """Yfinance se fresh data download karta hai (network call)."""
+    try:
+        df = yf.download(
+            ticker, period=f"{years_back + 1}y",
+            auto_adjust=True, progress=False, threads=False,
+        )
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+        if "Close" not in df.columns:
+            return None
+        df = df.dropna(subset=["Close"])
+        return df[["Close"]] if not df.empty else None
+    except Exception:
+        return None
+
+
+def seasonal_fetch_history(ticker: str, years_back: int, force_refresh: bool = False) -> Optional[pd.DataFrame]:
+    """Ek ticker ka (years_back+1) saal ka daily Close data laata hai.
+    Priority: disk cache (agar 30 din se fresh hai aur force_refresh nahi hai)
+    -> yfinance download (aur cache update) -> stale cache (fallback agar
+    download fail ho jaye)."""
+    if not force_refresh:
+        cached = _seasonal_load_cache(ticker)
+        if cached is not None and _seasonal_cache_age_days(ticker) < SEASONAL_CACHE_MAX_AGE_DAYS:
+            return cached
+
+    fresh = _seasonal_download_fresh(ticker, years_back)
+    if fresh is not None:
+        _seasonal_save_cache(ticker, fresh)
+        return fresh
+
+    # download fail hua (internet issue / rate-limit) -> jo bhi purana cache mile wahi use karo
+    return _seasonal_load_cache(ticker)
+
+
+def seasonal_refresh_all_cached(years_back: int, progress_cb=None) -> int:
+    """price_cache/ me jitne bhi tickers ka data pehle se saved hai, sabko
+    yfinance se force re-download karke overwrite karta hai. Returns count
+    of tickers successfully refreshed."""
+    cached_files = list(SEASONAL_CACHE_DIR.glob("*.csv"))
+    tickers = []
+    for f in cached_files:
+        stem = f.stem
+        if stem.endswith("_NS"):
+            tickers.append(stem[:-3] + ".NS")
+        elif stem.endswith("_BO"):
+            tickers.append(stem[:-3] + ".BO")
+        else:
+            tickers.append(stem)
+
+    refreshed = 0
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(_seasonal_download_fresh, tkr, years_back): tkr for tkr in tickers}
+        done = 0
+        for fut in as_completed(futures):
+            tkr = futures[fut]
+            done += 1
+            if progress_cb:
+                progress_cb(done / len(tickers) if tickers else 1.0)
+            try:
+                df = fut.result()
+            except Exception:
+                df = None
+            if df is not None:
+                _seasonal_save_cache(tkr, df)
+                refreshed += 1
+    return refreshed
+
+
+def seasonal_cache_status() -> Dict[str, Any]:
+    """Cache ka summary — kitne symbols cached hain aur sabse purana/naya kab update hua."""
+    cached_files = list(SEASONAL_CACHE_DIR.glob("*.csv"))
+    if not cached_files:
+        return {"count": 0, "oldest": None, "newest": None}
+    mtimes = [f.stat().st_mtime for f in cached_files]
+    return {
+        "count": len(cached_files),
+        "oldest": datetime.fromtimestamp(min(mtimes)),
+        "newest": datetime.fromtimestamp(max(mtimes)),
+    }
+
+
+def seasonal_nearest_trading_price(df: pd.DataFrame, target: date, direction: str):
+    """target date ke aas-paas nearest trading-day Close price dhoondhta hai.
+    direction='forward' -> target ya usse baad ka pehla trading din
+    direction='backward' -> target ya usse pehle ka aakhri trading din
+    """
+    idx = df.index
+    ts = pd.Timestamp(target)
+    if direction == "forward":
+        cand = idx[idx >= ts]
+        if len(cand) == 0:
+            return None, None
+        d = cand[0]
+    else:
+        cand = idx[idx <= ts]
+        if len(cand) == 0:
+            return None, None
+        d = cand[-1]
+    return d, float(df.loc[d, "Close"])
+
+
+def _safe_date(year: int, month: int, day: int) -> date:
+    """Builds a date, clamping day to the last valid day of that month
+    (e.g. day=31 for April becomes 30). Used so the day/month-only picker
+    never errors out on invalid combinations."""
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, min(day, last_day))
+
+
+def seasonal_scan_one_stock(df: pd.DataFrame, start_md: tuple, end_md: tuple,
+                             years_back: int, max_gap_days: int = 10) -> pd.DataFrame:
+    """Ek stock ke liye, pichhle 'years_back' saalon me diye gaye (month, day)
+    date-range ke andar har saal ka return nikalta hai."""
+    today = date.today()
+    current_year = today.year
+    wraps = (end_md[0], end_md[1]) < (start_md[0], start_md[1])  # e.g. 20-Dec se 15-Jan
+
+    records = []
+    for y in range(current_year - years_back, current_year + 1):
+        try:
+            start_date = date(y, start_md[0], start_md[1])
+        except ValueError:
+            continue  # e.g. 29 Feb non-leap year
+        end_year = y + 1 if wraps else y
+        try:
+            end_date = date(end_year, end_md[0], end_md[1])
+        except ValueError:
+            continue
+        if end_date > today:
+            continue  # future range abhi complete nahi hui
+
+        sd, sp = seasonal_nearest_trading_price(df, start_date, "forward")
+        ed, ep = seasonal_nearest_trading_price(df, end_date, "backward")
+        if sd is None or ed is None or ed <= sd:
+            continue
+        if (sd.date() - start_date).days > max_gap_days:
+            continue
+        if (end_date - ed.date()).days > max_gap_days:
+            continue
+
+        ret = (ep - sp) / sp * 100
+        records.append({
+            "Year": y,
+            "Start Date": sd.date(),
+            "End Date": ed.date(),
+            "Start Price": round(sp, 2),
+            "End Price": round(ep, 2),
+            "Return %": round(ret, 2),
+            "Profit": ret > 0,
+        })
+    return pd.DataFrame(records)
+
+
+def seasonal_summarize_symbol(sym: str, yearly_df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    if yearly_df.empty:
+        return None
+    total_years = len(yearly_df)
+    profit_years = int(yearly_df["Profit"].sum())
+    accuracy = profit_years / total_years * 100
+    return {
+        "Symbol": sym,
+        "Years Analyzed": total_years,
+        "Profitable Years": profit_years,
+        "Loss Years": total_years - profit_years,
+        "Accuracy %": round(accuracy, 1),
+        "Avg Return %": round(yearly_df["Return %"].mean(), 2),
+        "Best Year Return %": round(yearly_df["Return %"].max(), 2),
+        "Worst Year Return %": round(yearly_df["Return %"].min(), 2),
+    }
 
 
 # ============================================================================
@@ -2349,7 +2575,7 @@ st.sidebar.caption("Unified Engine — merged from both scanners")
 if "_pending_nav" in st.session_state:
     st.session_state["nav_page"] = st.session_state.pop("_pending_nav")
 
-page = st.sidebar.radio("Navigate", ["🔍 Scanner", "⭐ Watchlist", "📢 Bulk/Block Deals", "🧮 Position Sizing", "ℹ️ About"], label_visibility="collapsed", key="nav_page")
+page = st.sidebar.radio("Navigate", ["🔍 Scanner", "⭐ Watchlist", "📢 Bulk/Block Deals", "📅 Seasonal Scanner", "ℹ️ About"], label_visibility="collapsed", key="nav_page")
 
 st.sidebar.markdown("---")
 
@@ -2681,33 +2907,222 @@ elif page == "📢 Bulk/Block Deals":
             st.info("Click **Fetch deals** to load data for the selected period.")
 
 
-elif page == "🧮 Position Sizing":
-    st.title("Position Sizing Calculator")
-    st.caption("Work out how many shares to buy given your account size and risk tolerance.")
+elif page == "📅 Seasonal Scanner":
+    st.title("📅 Seasonal Date-Range Scanner")
+    st.caption(
+        "Ek date-range (sirf din-mahina, saal matter nahi) daalo — app pichhle N saal "
+        "ka data scan karke batayega kaunse stocks ne us range me consistently profit diya, "
+        "Accuracy % (win-rate) ke saath."
+    )
 
-    with st.form("position_sizing"):
+    with st.form("seasonal_scan"):
         c1, c2 = st.columns(2)
-        portfolio_size = c1.number_input("Portfolio size (₹)", min_value=0.0, value=100000.0, step=1000.0)
-        risk_pct = c2.number_input("Risk per trade (%)", min_value=0.1, max_value=100.0, value=1.0, step=0.1)
-        c3, c4 = st.columns(2)
-        entry = c3.number_input("Entry price (₹)", min_value=0.0, value=100.0, step=1.0)
-        stop_loss = c4.number_input("Stop loss (₹)", min_value=0.0, value=95.0, step=1.0)
-        submitted = st.form_submit_button("Calculate", type="primary")
+        universe_label = c1.selectbox(
+            "Universe",
+            ["Nifty 50", "Nifty 200", "Nifty 500", "Full NSE Cash Segment (slow, 1500+ stocks)", "Custom List"],
+            index=2,
+        )
+        custom_syms = []
+        if universe_label == "Custom List":
+            custom_syms = c2.multiselect("Pick symbols", ALL_KNOWN_SYMBOLS)
+            use_live_nse = False
+        else:
+            use_live_nse = c2.checkbox(
+                "Fetch live list from NSE", value=True,
+                help="Downloads the current constituent list directly from nseindia.com. "
+                     "Falls back to the built-in list if NSE blocks the request.",
+            )
+
+        d1, d2, d3, d4 = st.columns(4)
+        month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        today_date = date.today()
+        default_end = today_date + timedelta(days=30)
+        DUMMY_YEAR = 2024  # leap year, so 29 Feb stays selectable; year itself is ignored everywhere
+
+        from_month = d1.selectbox("From month", month_names, index=today_date.month - 1)
+        from_day = d2.number_input("From day", min_value=1, max_value=31, value=today_date.day, step=1)
+        to_month = d3.selectbox("To month", month_names, index=default_end.month - 1)
+        to_day = d4.number_input("To day", min_value=1, max_value=31, value=default_end.day, step=1)
+
+        start_input = _safe_date(DUMMY_YEAR, month_names.index(from_month) + 1, int(from_day))
+        end_input = _safe_date(DUMMY_YEAR, month_names.index(to_month) + 1, int(to_day))
+
+        s1, s2, s3 = st.columns(3)
+        years_back = s1.slider("Pichhle kitne saal scan karein?", 3, 20, 15)
+        min_years_required = s2.slider("Minimum saal ka data chahiye", 1, 20, 5)
+        min_accuracy = s3.slider("Minimum Accuracy %", 0, 100, 80)
+
+        submitted = st.form_submit_button("🔍 Scan Karo", type="primary", use_container_width=True)
+
+    cache_status = seasonal_cache_status()
+    cache_col1, cache_col2 = st.columns([3, 1])
+    with cache_col1:
+        if cache_status["count"] > 0:
+            st.caption(
+                f"📦 Local cache: **{cache_status['count']} symbol(s)** saved | "
+                f"oldest: {cache_status['oldest'].strftime('%d-%b-%Y')} | "
+                f"newest: {cache_status['newest'].strftime('%d-%b-%Y')} "
+                f"(auto-refreshes after {SEASONAL_CACHE_MAX_AGE_DAYS} din)"
+            )
+        else:
+            st.caption("📦 Local cache abhi khali hai — pehle scan ke baad yahan data save hoga.")
+    with cache_col2:
+        refresh_all_clicked = st.button(
+            "🔄 Refresh All Cached Data", use_container_width=True,
+            disabled=cache_status["count"] == 0,
+            help="Cache me jitne bhi symbols saved hain, sabka latest data yfinance se dobara download karke overwrite karega.",
+        )
+
+    if refresh_all_clicked:
+        refresh_progress = st.progress(0.0, text="Cached data refresh ho raha hai...")
+
+        def _update_refresh_progress(frac):
+            refresh_progress.progress(frac, text=f"Cached data refresh ho raha hai... {int(frac * 100)}%")
+
+        refreshed_count = seasonal_refresh_all_cached(years_back, progress_cb=_update_refresh_progress)
+        refresh_progress.empty()
+        st.success(f"✅ {refreshed_count}/{cache_status['count']} symbol(s) ka data refresh ho gaya.")
+        st.rerun()
 
     if submitted:
-        risk_amount = portfolio_size * (risk_pct / 100)
-        risk_per_share = entry - stop_loss
-        if risk_per_share <= 0:
-            st.error("Stop loss must be below entry price.")
+        fallback_key = {
+            "Nifty 50": "nifty50", "Nifty 200": "nifty200",
+            "Nifty 500": "nifty500", "Full NSE Cash Segment (slow, 1500+ stocks)": "nifty500",
+        }
+        if universe_label == "Custom List":
+            if not custom_syms:
+                st.error("Custom List me kam se kam ek symbol chuno.")
+                st.stop()
+            tickers = _add_suffix(custom_syms)
         else:
-            shares = int(risk_amount // risk_per_share)
-            position_value = shares * entry
-            r1, r2, r3 = st.columns(3)
-            r1.metric("Max risk amount", f"₹{risk_amount:,.0f}")
-            r2.metric("Shares to buy", f"{shares}")
-            r3.metric("Position value", f"₹{position_value:,.0f}")
-            if portfolio_size > 0:
-                st.caption(f"This position uses {position_value / portfolio_size * 100:.1f}% of your portfolio.")
+            tickers = None
+            if use_live_nse:
+                with st.spinner(f"Fetching latest {universe_label} list from nseindia.com..."):
+                    tickers = get_universe_live(universe_label)
+                if not tickers:
+                    st.warning(
+                        "Could not fetch the live list from NSE (it often blocks automated requests). "
+                        "Using the built-in list instead."
+                    )
+            if not tickers:
+                tickers = get_universe(fallback_key[universe_label])
+
+        min_years_required = min(min_years_required, years_back)
+        start_md = (start_input.month, start_input.day)
+        end_md = (end_input.month, end_input.day)
+
+        st.info(
+            f"Scanning **{len(tickers)} stock(s)** ({universe_label}) | Date range: "
+            f"**{start_input.strftime('%d %b')} → {end_input.strftime('%d %b')}** | "
+            f"Last **{years_back} years** | Min accuracy: **{min_accuracy}%**"
+        )
+
+        progress_bar = st.progress(0.0, text="Price data load ho raha hai...")
+        summary_rows, detail_store = [], {}
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = {ex.submit(seasonal_fetch_history, tkr, years_back): tkr for tkr in tickers}
+            done = 0
+            for fut in as_completed(futures):
+                tkr = futures[fut]
+                sym = tkr.replace(".NS", "")
+                done += 1
+                progress_bar.progress(done / len(tickers), text=f"Price data load ho raha hai... {done}/{len(tickers)}")
+                try:
+                    df = fut.result()
+                except Exception:
+                    df = None
+                if df is None or df.empty:
+                    continue
+                yearly_df = seasonal_scan_one_stock(df, start_md, end_md, years_back)
+                detail_store[sym] = yearly_df
+                summ = seasonal_summarize_symbol(sym, yearly_df)
+                if summ and summ["Years Analyzed"] >= min_years_required:
+                    summary_rows.append(summ)
+
+        progress_bar.empty()
+
+        if not summary_rows:
+            st.warning(
+                "Koi bhi stock minimum years/data requirement pura nahi kar paya. "
+                "'Minimum years' ya scan depth kam karke try karo."
+            )
+            st.session_state["seasonal_scan_result"] = None
+        else:
+            result_df = pd.DataFrame(summary_rows)
+            # Store everything needed to re-render the results in session_state so
+            # it survives reruns triggered by the "jump to detail" buttons below
+            # (a plain `if submitted:` block resets on every other widget click).
+            st.session_state["seasonal_scan_result"] = {
+                "result_df": result_df,
+                "detail_store": detail_store,
+                "min_accuracy": min_accuracy,
+                "start_label": start_input.strftime("%d%b"),
+                "end_label": end_input.strftime("%d%b"),
+            }
+
+    stored = st.session_state.get("seasonal_scan_result")
+    if stored is None:
+        st.info("⬆️ Universe, date-range, aur accuracy % set karke **'Scan Karo'** button dabao.")
+    else:
+        result_df = stored["result_df"]
+        detail_store = stored["detail_store"]
+        min_accuracy = stored["min_accuracy"]
+        filtered_df = result_df[result_df["Accuracy %"] >= min_accuracy].sort_values(
+            ["Accuracy %", "Avg Return %"], ascending=[False, False]
+        ).reset_index(drop=True)
+
+        st.subheader(
+            f"📊 Results — {len(filtered_df)} stock(s) with Accuracy ≥ {min_accuracy}% "
+            f"(out of {len(result_df)} analyzed)"
+        )
+
+        if filtered_df.empty:
+            st.warning(f"Is accuracy threshold ({min_accuracy}%) par koi stock match nahi hua. Slider se threshold kam karke dekho.")
+        else:
+            st.dataframe(
+                filtered_df, use_container_width=True, hide_index=True,
+                column_config={
+                    "Accuracy %": st.column_config.ProgressColumn("Accuracy %", min_value=0, max_value=100, format="%.1f%%"),
+                },
+            )
+
+            csv_bytes = filtered_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download CSV", data=csv_bytes,
+                file_name=f"seasonal_scan_{stored['start_label']}_{stored['end_label']}.csv",
+                mime="text/csv",
+            )
+
+            st.caption("Tap a symbol below to jump to its full scan/detail view (technical + fundamental + shareholding).")
+            unique_syms = filtered_df["Symbol"].dropna().unique().tolist()
+            pick_cols = st.columns(6)
+            for i, sym in enumerate(unique_syms[:24]):
+                if pick_cols[i % 6].button(sym, key=f"seasonal_view_{sym}", use_container_width=True):
+                    st.session_state.selected_symbol = f"{sym}.NS"
+                    st.session_state["_pending_nav"] = "🔍 Scanner"
+                    st.rerun()
+            if len(unique_syms) > 24:
+                st.caption(f"...and {len(unique_syms) - 24} more (use the accuracy/date filters above to narrow down).")
+
+            st.divider()
+            st.subheader("🔎 Year-by-Year Detail")
+            pick = st.selectbox("Stock chuno detail dekhne ke liye:", filtered_df["Symbol"].tolist())
+            if pick:
+                yd = detail_store[pick].sort_values("Year", ascending=False)
+
+                def _color_profit(v):
+                    return "color: green" if v is True else ("color: red" if v is False else "")
+
+                try:
+                    styled = yd.style.map(_color_profit, subset=["Profit"])
+                except AttributeError:
+                    styled = yd.style.applymap(_color_profit, subset=["Profit"])
+                st.dataframe(styled, use_container_width=True, hide_index=True)
+
+        with st.expander("📋 Full analysis (sabhi stocks, accuracy filter ke bina)"):
+            st.dataframe(result_df.sort_values("Accuracy %", ascending=False), use_container_width=True, hide_index=True)
 
 # ============================== ABOUT PAGE ================================
 else:
