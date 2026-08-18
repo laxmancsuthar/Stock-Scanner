@@ -1,90 +1,50 @@
-# Swing Trade Screener Pro (Streamlit)
+# Bundled Full NSE Symbol List (optional, but recommended for cloud hosting)
 
-Yeh ek Streamlit app hai jo NSE-listed stocks (Nifty 50 / 100 / 200 / 500) ko
-swing-trade setups ke liye scan karta hai. Isme ek unified **technical score**
-(0-100) aur **fundamental score** (ROE, growth, margins, debt, liquidity) diya
-jaata hai, saath hi watchlist, notes, position-sizing calculator aur PDF report
-export jaisi features bhi hain.
+By default this app tries to fetch the live "Full NSE Cash Segment" list
+(2500+ symbols) directly from nseindia.com. This usually works fine when
+you run the app on your own laptop, but **NSE blocks requests from cloud
+server IPs** (Streamlit Community Cloud, AWS, Render, etc.), so on a
+deployed app this live fetch will often fail and the app falls back to a
+small built-in list of ~294 stocks.
 
-> ⚠️ Yeh app sirf educational/research purpose ke liye hai. **Investment advice
-> nahi hai.** Trade lene se pehle apni khud ki research karein ya SEBI-registered
-> advisor se consult karein.
+To get full 2500+ coverage even when deployed, download the official list
+**once from your own browser** (browsers aren't blocked) and commit it to
+this repo. The app will automatically use it as a fallback whenever the
+live fetch fails — no code changes needed.
 
-## Features
+## Steps
 
-- **Scanner**: Nifty 50/100/200/500 (ya NSE se live ticker list) scan karke
-  swing-trade setups dhoondta hai (breakout, momentum, RSI divergence,
-  candlestick patterns, etc.)
-- **Technical Engine (0-100)**: EMA/SMA trend, RSI, MACD, Stochastic, ATR,
-  Bollinger Bands + squeeze, ADX/DI, volume confirmation, VWAP, breakout state
-  machine, candlestick patterns, weekly/monthly confluence
-- **Fundamental Score**: ROE, growth, margins, debt, liquidity (Yahoo Finance
-  data ke basis par)
-- **Stock Detail View**: Interactive candlestick chart (Plotly) with indicators
-- **Watchlist & Notes**: Session me aur `data.json` file me locally persist
-  hota hai
-- **Position Sizing Calculator**: Risk % ke hisaab se kitne shares kharidne hai
-- **PDF Report Export**: ReportLab se professional PDF report banata hai
-- **CSV Export**: Scan results ko CSV me download karein
+1. Go to: https://www.nseindia.com/market-data/securities-available-for-trading
+2. On that page there are **two similarly-named CSV files** — make sure you
+   pick the right one:
+   - ❌ "Securities available for trading in **SME** (.csv)" (~33 KB) — this
+     is the small SME segment (~500 stocks). **Not this one.**
+   - ✅ **"Securities available for **Equity segment** (.csv)"** (~147 KB) —
+     this is the main board with **2500+ stocks**. **This is the one you want.**
+   - Direct link (works in a normal browser, not from cloud/bots):
+     `https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv`
+3. Rename the downloaded file to exactly: `all_nse_symbols.csv`
+4. Place it in this folder, so the final path is:
+   ```
+   stock_lists/all_nse_symbols.csv
+   ```
+5. Commit and push it to GitHub along with the rest of the app.
 
-## Requirements
+That's it. On the next scan, whenever NSE's live fetch is blocked, the app
+will automatically pick up this bundled file instead of the small built-in
+list, and you'll see a caption like:
 
-- Python 3.9+
-- Internet connection (Yahoo Finance se live data fetch karne ke liye)
+> 📄 Using bundled full NSE list from `stock_lists/all_nse_symbols.csv` (2500+ symbols).
 
-## Installation
+## Keeping it up to date
 
-```bash
-# 1) (Optional but recommended) Virtual environment banayein
-python -m venv venv
-source venv/bin/activate      # Windows: venv\Scripts\activate
-
-# 2) Dependencies install karein
-pip install -r requirements.txt
-```
-
-## Run kaise karein
-
-```bash
-streamlit run swing_trade_screener_streamlit.py
-```
-
-Browser automatically `http://localhost:8501` par khul jaayega. Agar nahi
-khulta, to manually us URL ko open kar lein.
-
-## File Structure
-
-```
-.
-├── swing_trade_screener_streamlit.py   # Main app
-├── requirements.txt                     # Python dependencies
-├── README.md                            # Yeh file
-└── data.json                            # Auto-generated — watchlist/notes/history
-                                          # save karne ke liye (pehli run ke baad banta hai)
-```
+NSE adds/removes listings occasionally. Repeat the steps above (re-download
+and overwrite `all_nse_symbols.csv`, then commit) every few months, or
+whenever you notice a recently-listed stock is missing from scan results.
 
 ## Notes
 
-- **Data Source**: Saara price/fundamental data [`yfinance`](https://pypi.org/project/yfinance/)
-  library se aata hai, jo Yahoo Finance ko query karta hai. Prices delayed ho
-  sakte hain.
-- **Live NSE List**: Agar app me "live NSE list" fetch karne ka option select
-  karte hain, to `nseindia.com` ko directly query kiya jaata hai — yeh site
-  automated requests ko block kar sakti hai, aisi situation me app automatically
-  built-in ticker list use kar leta hai.
-- **Persistence**: Watchlist, notes aur scan history `data.json` (script ke
-  same folder me) me save hote hain, taaki app restart karne par bhi data safe
-  rahe.
-- **Large Universe Scans**: "Full NSE" (1500+ stocks) scan karne me kaafi time
-  lag sakta hai kyunki har stock ke liye Yahoo Finance se data fetch hota hai
-  (multi-threaded hai, par phir bhi slow ho sakta hai on free/rate-limited
-  connections).
-
-## Troubleshooting
-
-| Problem | Solution |
-|---|---|
-| `ModuleNotFoundError` | `pip install -r requirements.txt` dobara chalayein |
-| Scan bahut slow hai | Chhoti universe select karein (Nifty 50 ya 100) |
-| Live NSE fetch fail ho raha hai | Normal hai — NSE bots ko block karta hai; app fallback list use kar lega |
-| PDF export me error | `reportlab` aur `matplotlib` sahi se installed hain, verify karein |
+- This file is **not required** — the app works fine without it, just with
+  the smaller ~294-stock built-in fallback list when NSE blocks live fetch.
+- The file is excluded from `.gitignore`'s runtime-data rules — it's meant
+  to be committed, unlike `price_cache/` and `data.json`.
