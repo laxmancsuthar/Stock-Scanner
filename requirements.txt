@@ -1,16 +1,11 @@
-streamlit>=1.32
-pandas>=2.0
-numpy>=1.24
-requests>=2.31
-beautifulsoup4>=4.12
-lxml>=5.0
-yfinance>=0.2.40
-plotly>=5.18
-matplotlib>=3.7
-reportlab>=4.0
-nse>=3.2.1
-
-# Only needed if this app is deployed on a server/cloud host (Streamlit
-# Community Cloud, AWS, Docker, etc.) — set NSE_RUN_ON_SERVER = True in
-# app.py when using this. Not needed for running locally on your own PC.
-# httpx[http2]>=0.27
+streamlit
+pandas
+numpy
+requests
+beautifulsoup4
+yfinance
+plotly
+matplotlib
+reportlab
+nse
+httpx[http2]

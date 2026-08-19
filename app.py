@@ -1298,7 +1298,7 @@ def fetch_stock_detail(symbol: str, period: str = "1y") -> Optional[Dict[str, An
 # Running locally on your own machine/laptop, leave it False.
 # ============================================================================
 
-NSE_RUN_ON_SERVER = False  # True if this app is deployed on a cloud/server host
+NSE_RUN_ON_SERVER = True  # True if this app is deployed on a cloud/server host
 
 try:
     from nse import NSE as _NSEClient
