@@ -189,27 +189,97 @@ NSE_INDEX_URLS = {
     "Full NSE Cash Segment (slow, 1500+ stocks)": "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
 }
 
+# Alternate source (different domain — NSE Indices' own site, not nseindia.com)
+# tried if the primary URL above fails. Cloud hosts that get blocked by
+# nseindia.com sometimes aren't blocked here, so this can rescue a live fetch
+# without needing a bundled CSV at all.
+NSE_INDEX_URLS_ALT = {
+    "Nifty 50": "https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv",
+    "Nifty 200": "https://www.niftyindices.com/IndexConstituent/ind_nifty200list.csv",
+    "Nifty 500": "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv",
+}
+
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
 def get_universe_live(choice: str) -> Optional[List[str]]:
-    """Fetch the current constituent list directly from nseindia.com.
-    Returns None (instead of raising) if NSE blocks/rate-limits the request,
-    so the caller can fall back to the built-in list."""
+    """Fetch the current constituent list directly from NSE. Tries the
+    primary nseindia.com URL first, then an alternate domain (niftyindices.com)
+    if that fails. Returns None (instead of raising) if both are blocked, so
+    the caller can fall back to a bundled/hardcoded list."""
     session = requests.Session()
     session.headers.update(NSE_HEADERS)
+
+    urls_to_try = [u for u in [NSE_INDEX_URLS.get(choice), NSE_INDEX_URLS_ALT.get(choice)] if u]
+    for url in urls_to_try:
+        try:
+            if "nseindia.com" in url and "niftyindices" not in url:
+                session.get("https://www.nseindia.com", timeout=8)  # warms up cookies, NSE requires this
+            resp = session.get(url, timeout=15)
+            resp.raise_for_status()
+            df = pd.read_csv(io.StringIO(resp.text))
+            col = "Symbol" if "Symbol" in df.columns else "SYMBOL"
+            if "SERIES" in df.columns:
+                symbols = df.loc[df["SERIES"].astype(str).str.strip() == "EQ", col].astype(str).str.strip().tolist()
+            else:
+                symbols = df[col].astype(str).str.strip().tolist()
+            symbols = [s for s in symbols if s]
+            if symbols:
+                return _add_suffix(symbols)
+        except Exception:
+            continue
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Bundled index lists — static CSVs committed to the repo, used as a middle
+# fallback when live NSE fetch is blocked (very common on cloud hosting like
+# Streamlit Community Cloud, since NSE blocks datacenter IPs) but the small
+# built-in hardcoded lists aren't enough / accurate coverage.
+#
+# To enable for any universe: download the matching CSV from NSE (works fine
+# from a normal browser, only bots/cloud IPs get blocked) and save it under
+# stock_lists/ using the filenames below. See stock_lists/README.md for the
+# exact download links. Any file that isn't present is skipped silently and
+# that universe falls back to the small built-in list as before.
+# ----------------------------------------------------------------------------
+BUNDLED_LIST_DIR = Path(__file__).resolve().parent / "stock_lists"
+
+BUNDLED_LIST_FILES = {
+    "Nifty 50": "nifty50.csv",
+    "Nifty 200": "nifty200.csv",
+    "Nifty 500": "nifty500.csv",
+    "Full NSE Cash Segment (slow, 1500+ stocks)": "all_nse_symbols.csv",
+}
+
+
+@st.cache_data(show_spinner=False)
+def load_bundled_list(universe_label: str) -> Optional[List[str]]:
+    fname = BUNDLED_LIST_FILES.get(universe_label)
+    if not fname:
+        return None
+    path = BUNDLED_LIST_DIR / fname
+    if not path.exists():
+        return None
     try:
-        session.get("https://www.nseindia.com", timeout=8)  # warms up cookies, NSE requires this
-        resp = session.get(NSE_INDEX_URLS[choice], timeout=15)
-        resp.raise_for_status()
-        df = pd.read_csv(io.StringIO(resp.text))
-        col = "Symbol" if "Symbol" in df.columns else "SYMBOL"
+        df = pd.read_csv(path)
+        col = "SYMBOL" if "SYMBOL" in df.columns else ("Symbol" if "Symbol" in df.columns else df.columns[0])
         if "SERIES" in df.columns:
             symbols = df.loc[df["SERIES"].astype(str).str.strip() == "EQ", col].astype(str).str.strip().tolist()
+        elif " SERIES" in df.columns:  # NSE's CSV sometimes has a leading space in this header
+            symbols = df.loc[df[" SERIES"].astype(str).str.strip() == "EQ", col].astype(str).str.strip().tolist()
         else:
             symbols = df[col].astype(str).str.strip().tolist()
-        return _add_suffix(symbols)
+        symbols = sorted(set(s for s in symbols if s and s.lower() != "nan"))
+        return _add_suffix(symbols) if symbols else None
     except Exception:
         return None
+
+
+# Backward-compatible alias (full-segment specific) used by get_lookup_symbols
+def load_bundled_full_list() -> Optional[List[str]]:
+    return load_bundled_list("Full NSE Cash Segment (slow, 1500+ stocks)")
+
+
 
 
 # ============================================================================
@@ -2584,10 +2654,14 @@ def get_lookup_symbols() -> List[str]:
     """Full pool of symbols used for the Quick lookup autocomplete.
     Tries to pull the complete NSE cash-segment list (1500+ stocks, so
     recently listed names like WAAREEENER / WAAREERTL are included too);
-    falls back to the built-in Nifty 500 list if NSE blocks the request."""
+    falls back to the bundled full-NSE CSV (if present), then the built-in
+    Nifty 500 list, if NSE blocks the live request."""
     live = get_universe_live("Full NSE Cash Segment (slow, 1500+ stocks)")
     if live:
         return sorted(set(t.replace(".NS", "") for t in live))
+    bundled = load_bundled_full_list()
+    if bundled:
+        return sorted(set(t.replace(".NS", "") for t in bundled))
     return ALL_KNOWN_SYMBOLS
 
 
@@ -2672,11 +2746,21 @@ if page == "🔍 Scanner":
                 tickers = get_universe_live(universe_label)
             if not tickers:
                 st.warning(
-                    "Could not fetch the live list from NSE (it often blocks automated requests). "
-                    "Using the built-in list instead."
+                    "Could not fetch the live list from NSE (it often blocks automated requests, "
+                    "especially from cloud hosting)."
                 )
         if not tickers:
+            bundled = load_bundled_list(universe_label)
+            if bundled:
+                tickers = bundled
+                st.caption(f"📄 Using bundled {universe_label} list from `stock_lists/{BUNDLED_LIST_FILES[universe_label]}` ({len(bundled)} symbols).")
+        if not tickers:
             tickers = get_universe(fallback_key)
+            st.caption(
+                f"⚠️ Falling back to the small built-in list ({len(tickers)} symbols) — "
+                f"add `stock_lists/{BUNDLED_LIST_FILES.get(universe_label, 'all_nse_symbols.csv')}` to the repo for full coverage "
+                "even when NSE blocks live fetch (see stock_lists/README.md)."
+            )
 
         filters = {
             "min_technical_score": min_tech, "min_fundamental_score": min_fund,
@@ -3002,11 +3086,21 @@ elif page == "📅 Seasonal Scanner":
                     tickers = get_universe_live(universe_label)
                 if not tickers:
                     st.warning(
-                        "Could not fetch the live list from NSE (it often blocks automated requests). "
-                        "Using the built-in list instead."
+                        "Could not fetch the live list from NSE (it often blocks automated requests, "
+                        "especially from cloud hosting)."
                     )
             if not tickers:
+                bundled = load_bundled_list(universe_label)
+                if bundled:
+                    tickers = bundled
+                    st.caption(f"📄 Using bundled {universe_label} list from `stock_lists/{BUNDLED_LIST_FILES[universe_label]}` ({len(bundled)} symbols).")
+            if not tickers:
                 tickers = get_universe(fallback_key[universe_label])
+                st.caption(
+                    f"⚠️ Falling back to the small built-in list ({len(tickers)} symbols) — "
+                    f"add `stock_lists/{BUNDLED_LIST_FILES.get(universe_label, 'all_nse_symbols.csv')}` to the repo for full coverage "
+                    "even when NSE blocks live fetch (see stock_lists/README.md)."
+                )
 
         min_years_required = min(min_years_required, years_back)
         start_md = (start_input.month, start_input.day)
