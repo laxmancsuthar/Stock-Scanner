@@ -508,6 +508,833 @@ def seasonal_summarize_symbol(sym: str, yearly_df: pd.DataFrame) -> Optional[Dic
 
 
 # ============================================================================
+# SECTION 1C: SMART MOMENTUM + FUNDAMENTAL SCANNER
+# ----------------------------------------------------------------------------
+# Ported from streamlit_scanner.py (Pine-Script-style momentum/trend/strength
+# scoring + Screener.in fundamentals + breakout detection + chart + PDF).
+# Everything here is prefixed `sm_` to avoid clashing with the main app's
+# own scoring engine (score_technical/score_fundamental etc). Universe
+# selection reuses the main app's own get_universe_live/get_universe/
+# load_bundled_list — no duplicate NSE-fetch logic needed.
+# ============================================================================
+
+SM_DEFAULT_STOCKS = list(dict.fromkeys([
+    "RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK","INFOSYS","SBIN","HINDUNILVR","ITC","LT","KOTAKBANK","HCLTECH","BAJFINANCE","MARUTI","AXISBANK","ASIANPAINT","TITAN","WIPRO","SUNPHARMA","ULTRACEMCO","NTPC","POWERGRID","M&M","TATAMOTORS","TATASTEEL","ADANIENT","ADANIPORTS","JSWSTEEL","COALINDIA","BAJAJFINSV","ONGC","NESTLEIND","TECHM","GRASIM","INDUSINDBK","HDFCLIFE","SBILIFE","CIPLA","DRREDDY","DIVISLAB","EICHERMOT","HEROMOTOCO","BPCL","IOC","APOLLOHOSP","TATACONSUM","BRITANNIA","BAJAJ-AUTO","SHREECEM","HINDALCO","BANKBARODA","PNB","CANBK","UNIONBANK","FEDERALBNK","IDFCFIRSTB","BANDHANBNK","AUBANK","RBLBANK","YESBANK","CHOLAFIN","M&MFIN","SHRIRAMFIN","MUTHOOTFIN","LICHSGFIN","PNBHOUSING","MANAPPURAM","SBICARD","ICICIPRULI","ICICIGI","GICRE","NIACL","LICI","MPHASIS","LTIM","COFORGE","PERSISTENT","OFSS","KPITTECH","TATAELXSI","LTTS","AUROPHARMA","LUPIN","BIOCON","ALKEM","IPCALAB","TORNTPHARM","ABBOTINDIA","FORTIS","MAXHEALTH","METROPOLIS","LALPATHLAB","MOTHERSON","BOSCHLTD","BHARATFORG","BALKRISIND","MRF","APOLLOTYRE","CEATLTD","EXIDEIND","AMARARAJA","TVSMOTOR","ASHOKLEY","ESCORTS","TIINDIA","VEDL","SAIL","NMDC","HINDCOPPER","NATIONALUM","JSWENERGY","APLAPOLLO","ACC","AMBUJACEM","RAMCOCEM","JKCEMENT","DLF","GODREJPROP","OBEROIRLTY","PRESTIGE","PHOENIXLTD","SOBHA","BRIGADE","ADANIPOWER","ADANIGREEN","TATAPOWER","TORNTPOWER","CESC","NHPC","SJVN","IREDA","DABUR","MARICO","COLPAL","GODREJCP","EMAMILTD","VBL","RADICO","UBL","PIDILITIND","DEEPAKNTR","AARTIIND","NAVINFLUOR","IDEA","TATACOMM","ZEEL","PVRINOX","IRFC","RVNL","IRCON","KEC","KALPATPOWR","CONCOR","DELHIVERY","ABB","SIEMENS","HAVELLS","POLYCAB","CGPOWER","BHEL","BEL","HAL","COCHINSHIP","MAZDOCK","BEML","GRSE","TRENT","DMART","NYKAA","ZOMATO","PAYTM","POLICYBZR","INDHOTEL","UPL","PIIND","COROMANDEL","CHAMBLFERT","CDSL","BSE","MCX","CAMS","KALYANKJIL","INDUSTOWER","GMRINFRA","IGL","MGL","GAIL","PETRONET","GUJGASLTD","STARHEALTH","MFSL","NAUKRI","INDIAMART","RECLTD","PFC","GNFC","HFCL"
+]))
+
+
+def sm_resolve_universe(universe_label: str, use_live_nse: bool):
+    """Same fallback chain as the main Scanner/Seasonal Scanner pages (live NSE
+    -> bundled CSV -> hardcoded), returning plain symbols (no .NS) + a source note."""
+    if universe_label == "Full Default List (this scanner's built-in ~196 stocks)":
+        return SM_DEFAULT_STOCKS, "Built-in default list"
+    if universe_label == "Nifty 500 (app-wide fallback list)":
+        tickers = get_universe("nifty500")
+        return [t.replace(".NS", "") for t in tickers], "App-wide built-in Nifty 500-ish list"
+
+    tickers, source = None, None
+    if use_live_nse:
+        tickers = get_universe_live(universe_label)
+        if tickers:
+            source = "Live from NSE"
+    if not tickers:
+        bundled = load_bundled_list(universe_label)
+        if bundled:
+            tickers, source = bundled, f"Bundled CSV (stock_lists/{BUNDLED_LIST_FILES.get(universe_label, '?')})"
+    if not tickers:
+        tickers, source = _add_suffix(SM_DEFAULT_STOCKS), "Small built-in fallback list (not a true index match)"
+    return [t.replace(".NS", "") for t in tickers], source
+
+
+# ---- Fundamental filters — Screener.in scraper ----------------------------
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def sm_fetch_screener_html(symbol):
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                      'AppleWebKit/537.36 (KHTML, like Gecko) '
+                      'Chrome/124.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.screener.in/',
+    })
+    urls = [
+        f'https://www.screener.in/company/{symbol}/consolidated/',
+        f'https://www.screener.in/company/{symbol}/',
+    ]
+    for url in urls:
+        try:
+            r = session.get(url, timeout=12)
+            if r.status_code == 200:
+                return r.text
+        except Exception:
+            continue
+    return None
+
+
+def sm_parse_table(soup, section_id):
+    section = soup.find('section', {'id': section_id})
+    if not section:
+        return None
+    table = section.find('table')
+    if not table:
+        return None
+    rows = table.find_all('tr')
+    data = {}
+    headers = []
+    for i, row in enumerate(rows):
+        cols = row.find_all(['th', 'td'])
+        texts = [c.get_text(strip=True).replace(',', '').replace('%', '') for c in cols]
+        if i == 0:
+            headers = texts
+        else:
+            if texts:
+                label = texts[0]
+                try:
+                    vals = [float(v) if v not in ('', '-', '--') else None for v in texts[1:]]
+                except Exception:
+                    vals = texts[1:]
+                data[label] = vals
+    return data, headers[1:] if headers else []
+
+
+def sm_get_screener_data(symbol):
+    html = sm_fetch_screener_html(symbol)
+    if not html:
+        return None
+    soup = BeautifulSoup(html, 'lxml')
+    try:
+        q_result = sm_parse_table(soup, 'quarters')
+        a_result = sm_parse_table(soup, 'profit-loss')
+        result = {}
+
+        if q_result:
+            qdata, _ = q_result
+
+            def get_row(keys):
+                for k in keys:
+                    for label, vals in qdata.items():
+                        if k.lower() in label.lower():
+                            return vals
+                return None
+
+            pat_q = get_row(['Net Profit', 'PAT', 'Profit after tax'])
+            if pat_q and len(pat_q) >= 2:
+                p_last, p_prev = pat_q[-1], pat_q[-2]
+                if p_last is not None and p_prev is not None and p_prev != 0:
+                    result['pat_qoq_growth'] = round(((p_last - p_prev) / abs(p_prev)) * 100, 1)
+                    result['pat_latest_q'] = p_last
+
+            ebitda_q = get_row(['Operating Profit', 'EBITDA', 'OPM'])
+            if ebitda_q and len(ebitda_q) >= 2:
+                e_last, e_prev = ebitda_q[-1], ebitda_q[-2]
+                if e_last is not None and e_prev is not None and e_prev != 0:
+                    result['ebitda_qoq_growth'] = round(((e_last - e_prev) / abs(e_prev)) * 100, 1)
+
+            eps_q = get_row(['EPS'])
+            if eps_q and len(eps_q) >= 2:
+                e_last, e_prev = eps_q[-1], eps_q[-2]
+                if e_last is not None and e_prev is not None and e_prev != 0:
+                    result['eps_qoq_growth'] = round(((e_last - e_prev) / abs(e_prev)) * 100, 1)
+
+        if a_result:
+            adata, _ = a_result
+
+            def get_arow(keys):
+                for k in keys:
+                    for label, vals in adata.items():
+                        if k.lower() in label.lower():
+                            return vals
+                return None
+
+            pat_a = get_arow(['Net Profit', 'PAT', 'Profit after tax'])
+            if pat_a and len(pat_a) >= 2:
+                p_last, p_prev = pat_a[-1], pat_a[-2]
+                if p_last is not None and p_prev is not None and p_prev != 0:
+                    result['pat_yoy_growth'] = round(((p_last - p_prev) / abs(p_prev)) * 100, 1)
+
+            ebitda_a = get_arow(['Operating Profit', 'EBITDA'])
+            if ebitda_a and len(ebitda_a) >= 2:
+                e_last, e_prev = ebitda_a[-1], ebitda_a[-2]
+                if e_last is not None and e_prev is not None and e_prev != 0:
+                    result['ebitda_yoy_growth'] = round(((e_last - e_prev) / abs(e_prev)) * 100, 1)
+
+            eps_a = get_arow(['EPS'])
+            if eps_a and len(eps_a) >= 2:
+                e_last, e_prev = eps_a[-1], eps_a[-2]
+                if e_last is not None and e_prev is not None and e_prev != 0:
+                    result['eps_yoy_growth'] = round(((e_last - e_prev) / abs(e_prev)) * 100, 1)
+
+        bs_result = sm_parse_table(soup, 'balance-sheet')
+        if bs_result:
+            bsdata, _ = bs_result
+
+            def get_brow(keys):
+                for k in keys:
+                    for label, vals in bsdata.items():
+                        if k.lower() in label.lower():
+                            return vals
+                return None
+
+            debt = get_brow(['Borrowings', 'Total Debt', 'Long term borrowing'])
+            cash = get_brow(['Cash', 'Cash Equivalents', 'Cash and Bank'])
+            if debt and debt[-1] is not None:
+                result['total_debt'] = debt[-1]
+            if cash and cash[-1] is not None:
+                result['cash'] = cash[-1]
+
+            ratio_result = sm_parse_table(soup, 'ratios')
+            if ratio_result:
+                rdata, _ = ratio_result
+                for label, vals in rdata.items():
+                    if 'debt' in label.lower() and 'equity' in label.lower():
+                        if vals and vals[-1] is not None:
+                            result['debt_to_equity'] = vals[-1]
+
+        sh_section = soup.find('section', {'id': 'shareholding'})
+        if sh_section:
+            table = sh_section.find('table')
+            if table:
+                rows = table.find_all('tr')
+                sh_data = {}
+                for i, row in enumerate(rows):
+                    cols = row.find_all(['th', 'td'])
+                    texts = [c.get_text(strip=True).replace('%', '').replace(',', '') for c in cols]
+                    if i == 0:
+                        continue
+                    if texts and texts[0]:
+                        label = texts[0].strip()
+                        try:
+                            vals = [float(v) if v not in ('', '-', '--') else None for v in texts[1:]]
+                        except Exception:
+                            vals = [None] * len(texts[1:])
+                        sh_data[label] = vals
+
+                def get_sh(keys):
+                    for k in keys:
+                        for label, vals in sh_data.items():
+                            if k.lower() in label.lower():
+                                return vals
+                    return None
+
+                prom = get_sh(['Promoters', 'Promoter'])
+                if prom and len(prom) >= 2:
+                    p_cur, p_prev = prom[-1], prom[-2]
+                    if p_cur is not None:
+                        result['promoter_cur'] = round(p_cur, 2)
+                    if p_cur is not None and p_prev is not None:
+                        result['promoter_prev'] = round(p_prev, 2)
+                        result['promoter_chg'] = round(p_cur - p_prev, 2)
+
+                fii = get_sh(['FII', 'Foreign', 'FPI'])
+                if fii and len(fii) >= 2:
+                    f_cur, f_prev = fii[-1], fii[-2]
+                    if f_cur is not None:
+                        result['fii_cur'] = round(f_cur, 2)
+                    if f_cur is not None and f_prev is not None:
+                        result['fii_prev'] = round(f_prev, 2)
+                        result['fii_chg'] = round(f_cur - f_prev, 2)
+
+                dii = get_sh(['DII', 'Domestic Institution'])
+                if dii and len(dii) >= 2:
+                    d_cur, d_prev = dii[-1], dii[-2]
+                    if d_cur is not None:
+                        result['dii_cur'] = round(d_cur, 2)
+                    if d_cur is not None and d_prev is not None:
+                        result['dii_prev'] = round(d_prev, 2)
+                        result['dii_chg'] = round(d_cur - d_prev, 2)
+
+                pub = get_sh(['Public'])
+                if pub and len(pub) >= 2:
+                    pb_cur, pb_prev = pub[-1], pub[-2]
+                    if pb_cur is not None:
+                        result['public_cur'] = round(pb_cur, 2)
+                    if pb_cur is not None and pb_prev is not None:
+                        result['public_chg'] = round(pb_cur - pb_prev, 2)
+
+        return result if result else None
+    except Exception:
+        return None
+
+
+def sm_growth(vals, points=False):
+    if not vals or len(vals) < 2:
+        return None
+    last, prev = vals[-1], vals[-2]
+    if last is None or prev is None:
+        return None
+    if points:
+        return round(last - prev, 1)
+    if prev == 0:
+        return None
+    return round(((last - prev) / abs(prev)) * 100, 1)
+
+
+def sm_fmt(val, points=False):
+    if val is None:
+        return "—"
+    unit = "pts" if points else "%"
+    return f"{val:+.1f} {unit}" if points else f"{val:+.1f}{unit}"
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def sm_get_snapshot_rows(symbol):
+    html = sm_fetch_screener_html(symbol)
+    if not html:
+        return None
+    soup = BeautifulSoup(html, 'lxml')
+
+    q_result = sm_parse_table(soup, 'quarters')
+    a_result = sm_parse_table(soup, 'profit-loss')
+    cf_result = sm_parse_table(soup, 'cash-flow')
+
+    qdata = q_result[0] if q_result else {}
+    adata = a_result[0] if a_result else {}
+    cfdata = cf_result[0] if cf_result else {}
+
+    def find_row(data, keys):
+        for k in keys:
+            for label, vals in data.items():
+                if k.lower() in label.lower():
+                    return vals
+        return None
+
+    def row(label, keys, points=False, qoq=True, yoy=True):
+        q_val = sm_growth(find_row(qdata, keys), points=points) if qoq else None
+        a_val = sm_growth(find_row(adata, keys), points=points) if yoy else None
+        return {'Metric': label, 'QoQ': sm_fmt(q_val, points=points) if qoq else "—",
+                'YoY': sm_fmt(a_val, points=points) if yoy else "—"}
+
+    rows = [
+        row('EPS', ['EPS']),
+        row('OPM', ['OPM', 'Operating Profit Margin'], points=True),
+        row('Revenue', ['Sales', 'Revenue', 'Total Revenue']),
+        row('Sales Growth', ['Sales', 'Revenue']),
+        row('PAT', ['Net Profit', 'PAT', 'Profit after tax']),
+        row('PBT', ['Profit before tax', 'PBT']),
+        row('EBITDA', ['Operating Profit', 'EBITDA']),
+        row('Net Profit', ['Net Profit', 'PAT', 'Profit after tax']),
+    ]
+    cf_val = sm_growth(find_row(cfdata, ['Cash from Operating', 'Net Cash Flow', 'Cash from Operations']))
+    rows.append({'Metric': 'Cash Flow', 'QoQ': '—', 'YoY': sm_fmt(cf_val)})
+
+    if all(r['QoQ'] == '—' and r['YoY'] == '—' for r in rows):
+        return None
+    return rows
+
+
+def sm_passes_fundamental_filter(fdata):
+    if not fdata:
+        return False, ["Fundamental data na mila"]
+    reasons_pass, reasons_fail = [], []
+
+    if 'pat_qoq_growth' in fdata:
+        (reasons_pass if fdata['pat_qoq_growth'] > 0 else reasons_fail).append(
+            f"PAT QoQ {'+' if fdata['pat_qoq_growth'] > 0 else ''}{fdata['pat_qoq_growth']}%"
+            + ("" if fdata['pat_qoq_growth'] > 0 else " (negative)"))
+    else:
+        reasons_fail.append("PAT QoQ data nahi")
+
+    if 'pat_yoy_growth' in fdata:
+        (reasons_pass if fdata['pat_yoy_growth'] > 0 else reasons_fail).append(
+            f"PAT YoY {'+' if fdata['pat_yoy_growth'] > 0 else ''}{fdata['pat_yoy_growth']}%"
+            + ("" if fdata['pat_yoy_growth'] > 0 else " (negative)"))
+    else:
+        reasons_fail.append("PAT YoY data nahi")
+
+    if 'ebitda_qoq_growth' in fdata:
+        (reasons_pass if fdata['ebitda_qoq_growth'] > 0 else reasons_fail).append(
+            f"EBITDA QoQ {fdata['ebitda_qoq_growth']}%" + ("" if fdata['ebitda_qoq_growth'] > 0 else " (negative)"))
+    if 'ebitda_yoy_growth' in fdata:
+        (reasons_pass if fdata['ebitda_yoy_growth'] > 0 else reasons_fail).append(
+            f"EBITDA YoY {fdata['ebitda_yoy_growth']}%" + ("" if fdata['ebitda_yoy_growth'] > 0 else " (negative)"))
+    if 'eps_qoq_growth' in fdata:
+        (reasons_pass if fdata['eps_qoq_growth'] > 0 else reasons_fail).append(
+            f"EPS QoQ {fdata['eps_qoq_growth']}%" + ("" if fdata['eps_qoq_growth'] > 0 else " (negative)"))
+    if 'eps_yoy_growth' in fdata:
+        (reasons_pass if fdata['eps_yoy_growth'] > 0 else reasons_fail).append(
+            f"EPS YoY {fdata['eps_yoy_growth']}%" + ("" if fdata['eps_yoy_growth'] > 0 else " (negative)"))
+
+    if 'debt_to_equity' in fdata:
+        de = fdata['debt_to_equity']
+        (reasons_pass if de <= 0.5 else reasons_fail).append(f"{'Low' if de <= 0.5 else 'High'} D/E={de}")
+    elif 'total_debt' in fdata and 'cash' in fdata:
+        net_debt = fdata['total_debt'] - fdata['cash']
+        if net_debt <= 0:
+            reasons_pass.append("Net Debt Free (Cash > Debt)")
+        else:
+            reasons_fail.append(f"Net Debt={net_debt:.0f} Cr")
+
+    if 'cash' in fdata and fdata['cash'] > 0:
+        reasons_pass.append(f"Cash={fdata['cash']:.0f}Cr")
+
+    if 'promoter_chg' in fdata:
+        chg, cur = fdata['promoter_chg'], fdata.get('promoter_cur', '')
+        if chg >= 0:
+            reasons_pass.append(f"Promoter {'increased' if chg > 0 else 'intact'} ({cur}%, chg={chg:+.2f}%)")
+        else:
+            reasons_fail.append(f"Promoter reduced ({cur}%, chg={chg:+.2f}%)")
+    elif 'promoter_cur' in fdata:
+        reasons_pass.append(f"Promoter={fdata['promoter_cur']}%")
+
+    if 'fii_chg' in fdata:
+        chg, cur = fdata['fii_chg'], fdata.get('fii_cur', '')
+        (reasons_pass if chg >= 0 else reasons_fail).append(
+            f"FII {'up' if chg > 0 else 'stable' if chg == 0 else 'reduced'} ({cur}%, chg={chg:+.2f}%)")
+
+    if 'dii_chg' in fdata:
+        chg, cur = fdata['dii_chg'], fdata.get('dii_cur', '')
+        (reasons_pass if chg >= 0 else reasons_fail).append(
+            f"DII {'up' if chg > 0 else 'stable' if chg == 0 else 'reduced'} ({cur}%, chg={chg:+.2f}%)")
+
+    for m in ['pat_qoq_growth', 'pat_yoy_growth']:
+        if m in fdata and fdata[m] <= 0:
+            return False, reasons_fail + reasons_pass
+    if 'promoter_chg' in fdata and fdata['promoter_chg'] < -2.0:
+        return False, reasons_fail + reasons_pass
+    if len(reasons_fail) > len(reasons_pass):
+        return False, reasons_fail
+    return True, reasons_pass
+
+
+# ---- Momentum / trend / strength score (Pine Script logic) ----------------
+
+def sm_safe_ema(s, p):
+    return s.ewm(span=p, adjust=False).mean()
+
+
+def sm_calc_psar(df, af_step=0.02, af_max=0.2):
+    H = df['High'].values.astype(float)
+    L = df['Low'].values.astype(float)
+    psar = df['Close'].values.copy().astype(float)
+    trend = 1
+    af = af_step
+    hp, lp = H[0], L[0]
+    for i in range(2, len(psar)):
+        pp = psar[i - 1]
+        if trend == 1:
+            psar[i] = min(pp + af * (hp - pp), L[i - 1], L[i - 2])
+            if L[i] < psar[i]:
+                trend = -1; psar[i] = hp; lp = L[i]; af = af_step
+            elif H[i] > hp:
+                hp = H[i]; af = min(af + af_step, af_max)
+        else:
+            psar[i] = max(pp + af * (lp - pp), H[i - 1], H[i - 2])
+            if H[i] > psar[i]:
+                trend = 1; psar[i] = lp; hp = H[i]; af = af_step
+            elif L[i] < lp:
+                lp = L[i]; af = min(af + af_step, af_max)
+    return pd.Series(psar, index=df.index)
+
+
+def sm_calc_supertrend(df, mult=3, period=10):
+    hl2 = (df['High'] + df['Low']) / 2
+    tr = pd.concat([
+        df['High'] - df['Low'], (df['High'] - df['Close'].shift()).abs(), (df['Low'] - df['Close'].shift()).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(com=period - 1, adjust=False).mean()
+    upper, lower = hl2 + mult * atr, hl2 - mult * atr
+    direction = pd.Series(1, index=df.index)
+    for i in range(1, len(df)):
+        pu, pl = upper.iloc[i - 1], lower.iloc[i - 1]
+        if direction.iloc[i - 1] == -1:
+            upper.iloc[i] = max(upper.iloc[i], pu)
+        else:
+            lower.iloc[i] = min(lower.iloc[i], pl)
+        if df['Close'].iloc[i] > upper.iloc[i - 1]:
+            direction.iloc[i] = -1
+        elif df['Close'].iloc[i] < lower.iloc[i - 1]:
+            direction.iloc[i] = 1
+        else:
+            direction.iloc[i] = direction.iloc[i - 1]
+    return direction
+
+
+def sm_compute_momentum_score(df, len_=14):
+    if len(df) < 60:
+        return None
+    c = df['Close'].astype(float); h = df['High'].astype(float); l = df['Low'].astype(float); v = df['Volume'].astype(float)
+    hlc3 = (h + l + c) / 3
+    d = c.diff()
+    rsi = 100 - (100 / (1 + d.clip(lower=0).ewm(com=len_ - 1, adjust=False).mean() /
+                         ((-d.clip(upper=0)).ewm(com=len_ - 1, adjust=False).mean() + 1e-10)))
+    stoch = 100 * (c - l.rolling(len_).min()) / (h.rolling(len_).max() - l.rolling(len_).min() + 1e-10)
+    tc = hlc3.diff()
+    mfi = 100 - (100 / (1 + (hlc3 * v).where(tc > 0, 0).rolling(len_).sum() /
+                         ((hlc3 * v).where(tc <= 0, 0).rolling(len_).sum() + 1e-10)))
+    momS = (c.diff(10) > 0).astype(float) * 100
+    raw = (c - l.rolling(9).min()) / (h.rolling(9).max() - l.rolling(9).min() + 1e-10)
+    val = 0.0; vals = []
+    for rr in raw:
+        if pd.notna(rr):
+            val = max(-0.999, min(0.999, 0.33 * 2 * (rr - 0.5) + 0.67 * val))
+        vals.append(val)
+    fisher = 0.5 * np.log((1 + pd.Series(vals, index=c.index)) / (1 - pd.Series(vals, index=c.index)))
+    fisherS = (fisher > 0).astype(float) * 100
+    oscScore = (rsi + stoch + mfi + fisherS + momS) / 5
+
+    ml = sm_safe_ema(c, 12) - sm_safe_ema(c, 26)
+    macdS = (ml > sm_safe_ema(ml, 9)).astype(float) * 100
+    lag = int((len_ - 1) / 2)
+    zlemaS = (c > sm_safe_ema(c + (c - c.shift(lag)), len_)).astype(float) * 100
+    psarS = (c > sm_calc_psar(df)).astype(float) * 100
+    stS = (sm_calc_supertrend(df) == -1).astype(float) * 100
+    trendScore = (macdS + zlemaS + psarS + stS) / 4
+
+    ud = h.diff(); dd = -l.diff()
+    pdm = ud.where((ud > dd) & (ud > 0), 0); mdm = dd.where((dd > ud) & (dd > 0), 0)
+    tr2 = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    atrd = tr2.ewm(com=len_ - 1, adjust=False).mean()
+    pdi = 100 * pdm.ewm(com=len_ - 1, adjust=False).mean() / (atrd + 1e-10)
+    mdi = 100 * mdm.ewm(com=len_ - 1, adjust=False).mean() / (atrd + 1e-10)
+    adx = (100 * (pdi - mdi).abs() / (pdi + mdi + 1e-10)).ewm(com=len_ - 1, adjust=False).mean()
+    dmiS = (pdi > mdi).astype(float) * 100
+    adxS = (adx > 20).astype(float) * 100
+    vp = (h - l.shift()).abs(); vm = (l - h.shift()).abs()
+    vortS = (vp.rolling(len_).sum() > vm.rolling(len_).sum()).astype(float) * 100
+    avgVol20 = v.rolling(20).mean()
+    volS = (v > avgVol20).astype(float) * 100
+    smaBB = c.rolling(20).mean(); stdBB = c.rolling(20).std()
+    upperBB = smaBB + 2 * stdBB; lowerBB = smaBB - 2 * stdBB
+    percentB = (c - lowerBB) / ((upperBB - lowerBB) + 1e-10)
+    bbS = (percentB > 0.5).astype(float) * 100
+    strengthScore = (dmiS + adxS + vortS + volS + bbS) / 5
+
+    finalScore = oscScore * 0.40 + trendScore * 0.35 + strengthScore * 0.25
+
+    def last(s):
+        val = s.iloc[-1]
+        return None if pd.isna(val) else float(val)
+
+    osc, trend, strength, final = last(oscScore), last(trendScore), last(strengthScore), last(finalScore)
+    if any(x is None for x in [osc, trend, strength, final]):
+        return None
+
+    def sig(name, is_bull, detail=''):
+        return {'Signal': name, 'Status': '🟢 Bullish' if is_bull else '🔴 Bearish', 'Detail': detail}
+
+    cur_vol, cur_avgvol = last(v), last(avgVol20)
+    vol_ratio = (cur_vol / cur_avgvol) if cur_vol and cur_avgvol else None
+    cur_pctB, cur_upperBB, cur_lowerBB = last(percentB), last(upperBB), last(lowerBB)
+
+    signal_table = [
+        sig('MACD', last(macdS) == 100, 'ml > signal' if last(macdS) == 100 else 'ml < signal'),
+        sig('PSAR', last(psarS) == 100, 'Price above SAR' if last(psarS) == 100 else 'Price below SAR'),
+        sig('Supertrend', last(stS) == 100, 'Uptrend' if last(stS) == 100 else 'Downtrend'),
+        sig('ZLEMA', last(zlemaS) == 100, 'Above ZLEMA' if last(zlemaS) == 100 else 'Below ZLEMA'),
+        sig('DMI (+DI/-DI)', last(dmiS) == 100, f"+DI {last(pdi):.0f} / -DI {last(mdi):.0f}"),
+        sig('ADX', last(adxS) == 100, f"ADX {last(adx):.0f} ({'trending' if last(adxS) == 100 else 'weak'})"),
+        sig('Vortex', last(vortS) == 100, 'VI+ > VI-' if last(vortS) == 100 else 'VI+ < VI-'),
+        sig('RSI', last(rsi) > 50 if last(rsi) is not None else False, f"RSI {last(rsi):.0f}" if last(rsi) is not None else ''),
+        sig('Volume', last(volS) == 100,
+            f"Vol {cur_vol:,.0f} vs 20D-Avg {cur_avgvol:,.0f}" + (f" ({vol_ratio:.1f}x)" if vol_ratio else '')
+            if cur_vol and cur_avgvol else ''),
+        sig('Bollinger Band', last(bbS) == 100,
+            f"%B {cur_pctB:.2f} (U {cur_upperBB:.1f} / L {cur_lowerBB:.1f})" if cur_pctB is not None else ''),
+    ]
+    reasons = [f"{s['Signal']}: {s['Status'].split(' ')[1]}" for s in signal_table]
+
+    return {
+        'oscScore': round(osc, 1), 'trendScore': round(trend, 1), 'strengthScore': round(strength, 1),
+        'finalScore': round(final, 1), 'reasons': reasons, 'signal_table': signal_table,
+    }
+
+
+def sm_detect_breakout(df, lookback=60, pivot_window=5, near_pct=3.0):
+    result = {'near_breakout': False, 'breakout_type': [], 'details': []}
+    if len(df) < lookback + pivot_window * 2:
+        return result
+    c = df['Close'].astype(float)
+    recent = df.iloc[-lookback:]
+    hr = recent['High'].astype(float).values
+    n = len(hr)
+    cur_close = float(c.iloc[-1])
+
+    pivots = []
+    for i in range(pivot_window, n - pivot_window):
+        window = hr[i - pivot_window:i + pivot_window + 1]
+        if hr[i] == window.max():
+            pivots.append((i, hr[i]))
+    candidate_pivots = [p for p in pivots if p[0] < n - 3]
+
+    if candidate_pivots:
+        resistance_price = max(p[1] for p in candidate_pivots)
+        if resistance_price > 0:
+            dist_pct = (resistance_price - cur_close) / resistance_price * 100
+            if -1.5 <= dist_pct <= near_pct:
+                result['near_breakout'] = True
+                result['breakout_type'].append('Resistance')
+                result['resistance_level'] = round(resistance_price, 2)
+                result['details'].append(
+                    f"Resistance {resistance_price:.1f} se {dist_pct:.1f}% door (near breakout)" if dist_pct >= 0
+                    else f"Resistance {resistance_price:.1f} breakout ho chuka (+{-dist_pct:.1f}%)")
+
+    if len(candidate_pivots) >= 2:
+        pts = candidate_pivots[-4:] if len(candidate_pivots) >= 4 else candidate_pivots
+        xs = np.array([p[0] for p in pts], dtype=float)
+        ys = np.array([p[1] for p in pts], dtype=float)
+        if len(xs) >= 2 and (xs.max() - xs.min()) > 0:
+            slope, intercept = np.polyfit(xs, ys, 1)
+            if slope <= 0.0005 * ys.mean():
+                trend_val_now = slope * (n - 1) + intercept
+                if trend_val_now > 0:
+                    dist_pct2 = (trend_val_now - cur_close) / trend_val_now * 100
+                    if -1.5 <= dist_pct2 <= near_pct:
+                        result['near_breakout'] = True
+                        result['breakout_type'].append('Trendline')
+                        result['trendline_level'] = round(trend_val_now, 2)
+                        result['details'].append(
+                            f"Trendline {trend_val_now:.1f} se {dist_pct2:.1f}% door (near breakout)" if dist_pct2 >= 0
+                            else f"Trendline breakout ho chuka (+{-dist_pct2:.1f}%)")
+    return result
+
+
+def sm_chg_label(v):
+    if v is None or v == '':
+        return ''
+    return f"+{v}%" if v > 0 else f"{v}%"
+
+
+def sm_compute_red_flags(fd: dict) -> list:
+    flags = []
+    fd = fd or {}
+    if fd.get('pat_yoy_growth') is not None and fd['pat_yoy_growth'] < 0:
+        flags.append(f"PAT YoY declining ({fd['pat_yoy_growth']}%)")
+    if fd.get('pat_qoq_growth') is not None and fd['pat_qoq_growth'] < -10:
+        flags.append(f"PAT QoQ dropped sharply ({fd['pat_qoq_growth']}%)")
+    if fd.get('eps_yoy_growth') is not None and fd['eps_yoy_growth'] < 0:
+        flags.append(f"EPS YoY declining ({fd['eps_yoy_growth']}%)")
+    if fd.get('ebitda_yoy_growth') is not None and fd['ebitda_yoy_growth'] < 0:
+        flags.append(f"EBITDA YoY declining ({fd['ebitda_yoy_growth']}%)")
+    debt, cash = fd.get('total_debt'), fd.get('cash')
+    if debt is not None and cash is not None and cash > 0 and debt / cash > 3:
+        flags.append(f"High Debt vs Cash (Debt ₹{debt:,.0f} Cr vs Cash ₹{cash:,.0f} Cr)")
+    if fd.get('debt_to_equity') is not None:
+        try:
+            if float(fd['debt_to_equity']) > 1.5:
+                flags.append(f"High Debt/Equity ({fd['debt_to_equity']})")
+        except Exception:
+            pass
+    if fd.get('promoter_chg') is not None and fd['promoter_chg'] < 0:
+        flags.append(f"Promoter holding decreasing ({sm_chg_label(fd['promoter_chg'])})")
+    if fd.get('fii_chg') is not None and fd['fii_chg'] < 0 and fd.get('dii_chg') is not None and fd['dii_chg'] < 0:
+        flags.append("Both FII and DII reducing stake")
+    elif fd.get('fii_chg') is not None and fd['fii_chg'] < -1:
+        flags.append(f"FII holding decreasing ({sm_chg_label(fd['fii_chg'])})")
+    if fd.get('public_chg') is not None and fd['public_chg'] > 3:
+        flags.append(f"Public holding rising sharply ({sm_chg_label(fd['public_chg'])}) — possible distribution")
+    return flags
+
+
+# ---- Chart (interactive + static PNG for PDF) ------------------------------
+
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def sm_get_chart_history(symbol: str, period: str = "1y"):
+    try:
+        df = yf.Ticker(symbol + ".NS").history(period=period, interval="1d", auto_adjust=True)
+        if df is None or df.empty or len(df) < 30:
+            return None
+        df = df.copy()
+        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+        delta = df['Close'].diff()
+        gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+        rs = gain / loss.replace(0, np.nan)
+        df['RSI'] = 100 - (100 / (1 + rs))
+        return df
+    except Exception:
+        return None
+
+
+def sm_build_price_chart_plotly(df: pd.DataFrame, symbol: str):
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.55, 0.2, 0.25],
+        subplot_titles=(f"{symbol} — Price / EMA20 / EMA50", "Volume", "RSI (14)"),
+    )
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
+        name="Price", increasing_line_color="#16A34A", decreasing_line_color="#DC2626",
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['EMA20'], name="EMA20", line=dict(color="#2563EB", width=1.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['EMA50'], name="EMA50", line=dict(color="#EA580C", width=1.2)), row=1, col=1)
+    vol_colors = ["#16A34A" if df['Close'].iloc[i] >= df['Open'].iloc[i] else "#DC2626" for i in range(len(df))]
+    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=vol_colors, name="Volume"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name="RSI", line=dict(color="#0EA5E9", width=1.3)), row=3, col=1)
+    fig.add_hline(y=70, line_dash="dot", line_color="#DC2626", row=3, col=1)
+    fig.add_hline(y=30, line_dash="dot", line_color="#16A34A", row=3, col=1)
+    fig.update_layout(
+        height=650, xaxis_rangeslider_visible=False, margin=dict(t=40, b=10, l=10, r=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def sm_build_price_chart_image(df: pd.DataFrame, symbol: str) -> bytes:
+    x = mdates.date2num(df.index.to_pydatetime())
+    n = len(df)
+    fig, (ax_price, ax_vol, ax_rsi) = plt.subplots(
+        3, 1, figsize=(9, 8), sharex=True, gridspec_kw={"height_ratios": [3, 1, 1], "hspace": 0.25},
+    )
+    width = (x[-1] - x[0]) / max(n, 1) * 0.7 if n > 1 else 0.7
+    price_range = (df['High'].max() - df['Low'].min()) or 1.0
+    for i in range(n):
+        color = "#16A34A" if df['Close'].iloc[i] >= df['Open'].iloc[i] else "#DC2626"
+        ax_price.plot([x[i], x[i]], [df['Low'].iloc[i], df['High'].iloc[i]], color=color, linewidth=0.9)
+        y0, y1 = sorted([df['Open'].iloc[i], df['Close'].iloc[i]])
+        body_h = max(y1 - y0, price_range * 0.0025)
+        ax_price.add_patch(plt.Rectangle((x[i] - width / 2, y0), width, body_h, facecolor=color, edgecolor=color, linewidth=0.4))
+    ax_price.plot(x, df['EMA20'], color="#2563EB", linewidth=1.2, label="EMA20")
+    ax_price.plot(x, df['EMA50'], color="#EA580C", linewidth=1.2, label="EMA50")
+    ax_price.set_title(f"{symbol} — Price / EMA20 / EMA50", fontsize=11, fontweight="bold")
+    ax_price.legend(loc="upper left", fontsize=8)
+    ax_price.grid(alpha=0.3)
+    vol_colors = ["#16A34A" if df['Close'].iloc[i] >= df['Open'].iloc[i] else "#DC2626" for i in range(n)]
+    ax_vol.bar(x, df['Volume'], color=vol_colors, width=width, alpha=0.85)
+    ax_vol.set_title("Volume", fontsize=9, fontweight="bold", loc="left")
+    ax_vol.grid(alpha=0.3)
+    ax_rsi.plot(x, df['RSI'], color="#0EA5E9", linewidth=1.2)
+    ax_rsi.axhline(70, color="#DC2626", linewidth=0.8, linestyle="--")
+    ax_rsi.axhline(30, color="#16A34A", linewidth=0.8, linestyle="--")
+    ax_rsi.set_ylim(0, 100)
+    ax_rsi.set_title("RSI (14)", fontsize=9, fontweight="bold", loc="left")
+    ax_rsi.grid(alpha=0.3)
+    ax_rsi.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    fig.autofmt_xdate()
+    buf = BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", dpi=180)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def sm_build_stock_pdf(r: dict, chart_png: Optional[bytes]) -> bytes:
+    fd = r.get('fund_data', {}) or {}
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('SMTitleX', parent=styles['Title'], fontSize=18, spaceAfter=4)
+    h2 = ParagraphStyle('SMH2', parent=styles['Heading2'], fontSize=12, spaceBefore=10, spaceAfter=4)
+    body = ParagraphStyle('SMBodyX', parent=styles['Normal'], fontSize=9.5, leading=13)
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=16 * mm, bottomMargin=14 * mm, leftMargin=16 * mm, rightMargin=16 * mm)
+    story = []
+    story.append(Paragraph(f"{r['symbol']} — Scan Report", title_style))
+    story.append(Paragraph(f"Generated: {datetime.now().strftime('%d-%b-%Y %H:%M')}", body))
+    story.append(Spacer(1, 6))
+
+    score_table = Table([
+        ["Final Score", "Momentum", "Trend", "Strength"],
+        [f"{r['finalScore']}/100", r['oscScore'], r['trendScore'], r['strengthScore']],
+    ], colWidths=[40 * mm] * 4)
+    score_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#0F172A")),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTSIZE', (0, 0), (-1, -1), 10), ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6), ('TOPPADDING', (0, 0), (-1, -1), 6),
+    ]))
+    story.append(score_table)
+
+    if chart_png:
+        story.append(Spacer(1, 10))
+        story.append(RLImage(BytesIO(chart_png), width=170 * mm, height=151 * mm))
+
+    story.append(Paragraph("✅ Reasons", h2))
+    reasons = (['Selected via: ' + ', '.join(r.get('selected_via', []))] if r.get('selected_via') else [])
+    reasons += r.get('breakout_details', [])
+    reasons += (r.get('fund_reasons') or [])
+    if not reasons:
+        reasons = ["No specific reasons captured."]
+    for rr in reasons:
+        story.append(Paragraph(f"• {rr}", body))
+
+    story.append(Paragraph("🚩 Red Flags", h2))
+    red_flags = sm_compute_red_flags(fd)
+    if not red_flags:
+        story.append(Paragraph("No red flags found.", body))
+    else:
+        for f in red_flags:
+            story.append(Paragraph(f"• {f}", body))
+
+    story.append(Paragraph("Fundamentals Snapshot", h2))
+    fund_rows = [["Metric", "Value"]]
+    fund_map = [
+        ("PAT QoQ Growth %", fd.get('pat_qoq_growth')), ("PAT YoY Growth %", fd.get('pat_yoy_growth')),
+        ("EPS QoQ Growth %", fd.get('eps_qoq_growth')), ("EPS YoY Growth %", fd.get('eps_yoy_growth')),
+        ("EBITDA YoY Growth %", fd.get('ebitda_yoy_growth')),
+        ("Total Debt (Cr)", fd.get('total_debt')), ("Cash & Equiv (Cr)", fd.get('cash')),
+        ("Debt/Equity", fd.get('debt_to_equity')),
+        ("Promoter Holding % (Cur)", fd.get('promoter_cur')), ("Promoter Change %", sm_chg_label(fd.get('promoter_chg'))),
+        ("FII Holding % (Cur)", fd.get('fii_cur')), ("FII Change %", sm_chg_label(fd.get('fii_chg'))),
+        ("DII Holding % (Cur)", fd.get('dii_cur')), ("DII Change %", sm_chg_label(fd.get('dii_chg'))),
+    ]
+    for label, val in fund_map:
+        if val not in (None, ''):
+            fund_rows.append([label, str(val)])
+    if len(fund_rows) > 1:
+        ft = Table(fund_rows, colWidths=[90 * mm, 60 * mm])
+        ft.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#E2E8F0")),
+            ('FONTSIZE', (0, 0), (-1, -1), 9), ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor("#CBD5E1")),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4), ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        story.append(ft)
+    else:
+        story.append(Paragraph("No fundamental data available.", body))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def sm_build_result_row(r):
+    fd = r.get('fund_data', {}) or {}
+    return {
+        'Stock': r['symbol'], 'Scan Date': datetime.now().strftime("%d-%m-%Y %H:%M"),
+        'Selected Via': '+'.join(r.get('selected_via', [])) or 'Momentum Score',
+        'Final Score': r['finalScore'], 'Momentum Score': r['oscScore'],
+        'Trend Score': r['trendScore'], 'Strength Score': r['strengthScore'],
+        'Technical Signals': ', '.join(r['reasons']),
+        'Breakout Type': ', '.join(r.get('breakout_type', [])),
+        'Breakout Details': ' | '.join(r.get('breakout_details', [])),
+        'Resistance Level': r.get('resistance_level', ''), 'Trendline Level': r.get('trendline_level', ''),
+        'PAT QoQ Growth %': fd.get('pat_qoq_growth', ''), 'PAT YoY Growth %': fd.get('pat_yoy_growth', ''),
+        'PAT Latest Quarter (Cr)': fd.get('pat_latest_q', ''),
+        'EBITDA QoQ Growth %': fd.get('ebitda_qoq_growth', ''), 'EBITDA YoY Growth %': fd.get('ebitda_yoy_growth', ''),
+        'EPS QoQ Growth %': fd.get('eps_qoq_growth', ''), 'EPS YoY Growth %': fd.get('eps_yoy_growth', ''),
+        'Debt/Equity Ratio': fd.get('debt_to_equity', ''), 'Total Debt (Cr)': fd.get('total_debt', ''),
+        'Cash & Equivalents (Cr)': fd.get('cash', ''),
+        'Net Debt (Cr)': round(fd['total_debt'] - fd['cash'], 1) if fd.get('total_debt') and fd.get('cash') else '',
+        'Promoter Holding % (Cur)': fd.get('promoter_cur', ''), 'Promoter Holding % (Prev)': fd.get('promoter_prev', ''),
+        'Promoter Change %': sm_chg_label(fd.get('promoter_chg')),
+        'FII Holding % (Cur)': fd.get('fii_cur', ''), 'FII Holding % (Prev)': fd.get('fii_prev', ''),
+        'FII Change %': sm_chg_label(fd.get('fii_chg')),
+        'DII Holding % (Cur)': fd.get('dii_cur', ''), 'DII Holding % (Prev)': fd.get('dii_prev', ''),
+        'DII Change %': sm_chg_label(fd.get('dii_chg')),
+        'Public Holding % (Cur)': fd.get('public_cur', ''), 'Public Change %': sm_chg_label(fd.get('public_chg')),
+        'Fundamental Signals': ', '.join(r.get('fund_reasons', [])),
+    }
+
+
+def sm_render_snapshot_widget(symbol, key_prefix, expanded=False):
+    with st.expander("📋 Fundamental snapshot", expanded=expanded):
+        cap_col, btn_col = st.columns([6, 1])
+        with cap_col:
+            st.caption("Auto-loads from screener.in (cached ~6 hours — repeat views are instant).")
+        with btn_col:
+            if st.button("🔄", key=f"{key_prefix}_refresh", help="Force refresh (clear cache)"):
+                sm_fetch_screener_html.clear()
+                sm_get_snapshot_rows.clear()
+        with st.spinner(f"Loading {symbol} snapshot..."):
+            snap_rows = sm_get_snapshot_rows(symbol)
+        if snap_rows:
+            st.dataframe(pd.DataFrame(snap_rows), use_container_width=True, hide_index=True)
+        else:
+            st.warning("Snapshot data nahi mila (screener.in se fetch fail ya symbol invalid).")
+
+
+# ============================================================================
 # SECTION 2: UNIFIED TECHNICAL ENGINE
 # ----------------------------------------------------------------------------
 # Merges two scanners:
@@ -2645,7 +3472,7 @@ st.sidebar.caption("Unified Engine — merged from both scanners")
 if "_pending_nav" in st.session_state:
     st.session_state["nav_page"] = st.session_state.pop("_pending_nav")
 
-page = st.sidebar.radio("Navigate", ["🔍 Scanner", "⭐ Watchlist", "📢 Bulk/Block Deals", "📅 Seasonal Scanner", "ℹ️ About"], label_visibility="collapsed", key="nav_page")
+page = st.sidebar.radio("Navigate", ["🔍 Scanner", "⭐ Watchlist", "📢 Bulk/Block Deals", "📅 Seasonal Scanner", "🎯 Smart Scanner", "ℹ️ About"], label_visibility="collapsed", key="nav_page")
 
 st.sidebar.markdown("---")
 
@@ -3217,6 +4044,222 @@ elif page == "📅 Seasonal Scanner":
 
         with st.expander("📋 Full analysis (sabhi stocks, accuracy filter ke bina)"):
             st.dataframe(result_df.sort_values("Accuracy %", ascending=False), use_container_width=True, hide_index=True)
+
+# ============================ SMART SCANNER ================================
+elif page == "🎯 Smart Scanner":
+    st.title("🎯 Smart Momentum + Fundamental Scanner")
+    st.caption("Momentum + Trend + Strength score (Pine-Script style) + Breakout detection + Screener.in fundamentals.")
+
+    with st.form("smart_scanner_form"):
+        c1, c2 = st.columns(2)
+        score_min, score_max = c1.slider("Momentum Score Range", 0, 100, (80, 100), 1)
+        breakout_near_pct = c2.slider(
+            "Breakout Near %", 0.5, 10.0, 2.0, 0.5,
+            help="Resistance/trendline ke kitne % andar aane par 'near breakout' maana jaye",
+        )
+        run_fundamentals = st.checkbox(
+            "Run Fundamental Check (Screener.in)", value=True,
+            help="Off karne se sirf momentum + breakout filter chalega (fast, koi Screener.in call nahi)",
+        )
+
+        u1, u2 = st.columns(2)
+        sm_universe_options = [
+            "Full Default List (this scanner's built-in ~196 stocks)",
+            "Nifty 50", "Nifty 200", "Nifty 500",
+            "Full NSE Cash Segment (slow, 1500+ stocks)",
+            "Custom List",
+        ]
+        sm_universe_choice = u1.selectbox("Universe", sm_universe_options, index=0)
+        sm_custom_syms = []
+        sm_use_live = True
+        if sm_universe_choice == "Custom List":
+            sm_custom_syms = u2.multiselect("Pick symbols", options=SM_DEFAULT_STOCKS)
+        elif sm_universe_choice == "Full Default List (this scanner's built-in ~196 stocks)":
+            u2.caption(" ")
+        else:
+            sm_use_live = u2.checkbox(
+                "Fetch live list from NSE", value=True,
+                help="Downloads the current constituent list from nseindia.com. "
+                     "Falls back to a bundled CSV (if present) or the built-in list if NSE blocks the request.",
+            )
+
+        smart_submitted = st.form_submit_button("🚀 Run Scanner", type="primary", use_container_width=True)
+
+    if smart_submitted:
+        if sm_universe_choice == "Custom List":
+            stocks_to_scan = sm_custom_syms if sm_custom_syms else SM_DEFAULT_STOCKS
+            universe_source = "Custom selection" if sm_custom_syms else "Custom (empty) → built-in default"
+        else:
+            with st.spinner(f"Resolving {sm_universe_choice} list..."):
+                stocks_to_scan, universe_source = sm_resolve_universe(sm_universe_choice, sm_use_live)
+
+        st.info(
+            f"Scanning **{len(stocks_to_scan)} stock(s)** ({universe_source}) | "
+            f"Momentum {score_min}-{score_max} | Breakout near {breakout_near_pct}%"
+        )
+
+        total = len(stocks_to_scan)
+        momentum_hits = []
+        prog1 = st.progress(0.0, text="Phase 1: Momentum + Breakout scan...")
+        for i, sym in enumerate(stocks_to_scan, 1):
+            prog1.progress(i / total, text=f"Scanning {sym} ({i}/{total})")
+            try:
+                df = yf.Ticker(sym + ".NS").history(period="6mo", interval="1d", auto_adjust=True)
+                if df is None or len(df) < 50:
+                    continue
+                score = sm_compute_momentum_score(df)
+                breakout = sm_detect_breakout(df, near_pct=breakout_near_pct)
+                score_in_range = bool(score and score_min <= score['finalScore'] <= score_max)
+                is_breakout = bool(breakout['near_breakout'])
+                if score_in_range and is_breakout:
+                    momentum_hits.append({
+                        'symbol': sym, **score,
+                        'selected_via': ['Momentum Score', 'Breakout'],
+                        'breakout_type': breakout['breakout_type'],
+                        'breakout_details': breakout['details'],
+                        'resistance_level': breakout.get('resistance_level', ''),
+                        'trendline_level': breakout.get('trendline_level', ''),
+                    })
+            except Exception:
+                pass
+        prog1.empty()
+
+        matches = []
+        if momentum_hits and run_fundamentals:
+            prog2 = st.progress(0.0, text="Phase 2: Fundamental check (Screener.in)...")
+            n2 = len(momentum_hits)
+            for i, stock in enumerate(momentum_hits, 1):
+                sym = stock['symbol']
+                prog2.progress(i / n2, text=f"Checking fundamentals {sym} ({i}/{n2})")
+                fdata = sm_get_screener_data(sym)
+                passed, fund_reasons = sm_passes_fundamental_filter(fdata)
+                if passed:
+                    stock['fund_reasons'] = fund_reasons
+                    stock['fund_data'] = fdata
+                    matches.append(stock)
+                _time.sleep(1.2)  # Screener.in rate-limit se bachne ke liye
+            prog2.empty()
+        elif momentum_hits and not run_fundamentals:
+            for stock in momentum_hits:
+                stock['fund_reasons'] = ['Fundamental check skipped']
+                stock['fund_data'] = {}
+                matches.append(stock)
+
+        matches.sort(key=lambda x: (x['finalScore'] if x['finalScore'] is not None else -1), reverse=True)
+        # Persist to session_state so the Detail View's "jump to symbol" /
+        # PDF-download buttons below don't wipe these results on rerun
+        # (same fix as the Seasonal Scanner page).
+        st.session_state["sm_scan_result"] = {
+            "matches": matches, "momentum_hits": momentum_hits, "run_fundamentals": run_fundamentals,
+        }
+
+    stored = st.session_state.get("sm_scan_result")
+    if stored is None:
+        st.info("⬆️ Settings choose karke **Run Scanner** dabao.")
+    else:
+        matches = stored["matches"]
+        momentum_hits = stored["momentum_hits"]
+        ran_fund = stored["run_fundamentals"]
+
+        if matches:
+            st.markdown("---")
+            st.success(f"🎯 {len(matches)} stocks matched — Momentum + Breakout" + (" + Fundamentals" if ran_fund else ""))
+
+            rows = [sm_build_result_row(r) for r in matches]
+            result_df = pd.DataFrame(rows)
+            summary_df = result_df[[
+                'Stock', 'Final Score', 'Momentum Score', 'Trend Score', 'Strength Score',
+                'Selected Via', 'Breakout Type',
+            ]]
+            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+            csv = result_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "⬇️ Download Full Results (CSV)", data=csv,
+                file_name=f"smart_scan_result_{datetime.now().strftime('%d-%m-%Y_%H-%M')}.csv",
+                mime="text/csv",
+            )
+
+            st.markdown("### Detail View")
+            match_lookup = {r['symbol']: r for r in matches}
+            pick_symbol = st.selectbox(
+                "Stock chuno detail dekhne ke liye:",
+                options=list(match_lookup.keys()),
+                format_func=lambda s: f"{s}  —  Score: {match_lookup[s]['finalScore']}/100",
+            )
+            if pick_symbol:
+                r = match_lookup[pick_symbol]
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("Momentum (Osc)", r['oscScore'])
+                mc2.metric("Trend", r['trendScore'])
+                mc3.metric("Strength", r['strengthScore'])
+
+                with st.spinner(f"Loading {pick_symbol} chart..."):
+                    chart_df = sm_get_chart_history(pick_symbol)
+                if chart_df is not None:
+                    st.plotly_chart(sm_build_price_chart_plotly(chart_df, pick_symbol), use_container_width=True)
+                else:
+                    st.caption("Chart data load nahi ho paya.")
+
+                col_a, col_b = st.columns(2)
+                fund_data = r.get('fund_data', {}) or {}
+                red_flags = sm_compute_red_flags(fund_data)
+                with col_a:
+                    st.markdown("#### ✅ Reasons")
+                    reasons = []
+                    if r.get('selected_via'):
+                        reasons.append('Selected via: ' + ', '.join(r['selected_via']))
+                    reasons += r.get('breakout_details', [])
+                    reasons += (r.get('fund_reasons') or [])
+                    if reasons:
+                        for rr in reasons:
+                            st.markdown(f"- {rr}")
+                    else:
+                        st.caption("No specific reasons captured.")
+                with col_b:
+                    st.markdown("#### 🚩 Red Flags")
+                    if red_flags:
+                        for f in red_flags:
+                            st.markdown(f"- {f}")
+                    else:
+                        st.caption("No red flags found.")
+
+                if r.get('signal_table'):
+                    st.write("**Technical Signals:**")
+                    st.dataframe(pd.DataFrame(r['signal_table']), use_container_width=True, hide_index=True)
+                if r.get('breakout_type'):
+                    st.write("**Breakout Type:**", ', '.join(r['breakout_type']))
+
+                sm_render_snapshot_widget(r['symbol'], key_prefix=f"sm_match_{r['symbol']}")
+
+                if st.button("📄 Download PDF Report", key=f"sm_pdf_btn_{pick_symbol}"):
+                    with st.spinner("PDF bana raha hai..."):
+                        chart_png = sm_build_price_chart_image(chart_df, pick_symbol) if chart_df is not None else None
+                        pdf_bytes = sm_build_stock_pdf(r, chart_png)
+                    st.download_button(
+                        "⬇️ Save PDF", data=pdf_bytes,
+                        file_name=f"{pick_symbol}_report_{datetime.now().strftime('%d-%m-%Y')}.pdf",
+                        mime="application/pdf", key=f"sm_pdf_dl_{pick_symbol}",
+                    )
+        elif momentum_hits and not matches:
+            st.warning(
+                "Momentum/breakout filter mein stocks aaye, par fundamentals mein koi pass nahi hua. "
+                "Fundamental filters loosen karo ya 'Run Fundamental Check' off karke dekho."
+            )
+        else:
+            st.info("Koi stock nahi mila score range aur breakout condition mein. Range ya breakout % adjust karke try karo.")
+
+    st.divider()
+    st.markdown("#### 🔍 Quick Fundamental Lookup")
+    lq1, lq2 = st.columns([4, 1])
+    with lq1:
+        sm_lookup_symbol = st.text_input(
+            "NSE Symbol", value="", placeholder="e.g. RELIANCE", key="sm_lookup_input", label_visibility="collapsed",
+        )
+    with lq2:
+        sm_lookup_go = st.button("Load", key="sm_lookup_go", use_container_width=True)
+    if sm_lookup_go and sm_lookup_symbol.strip():
+        sm_render_snapshot_widget(sm_lookup_symbol.strip().upper(), key_prefix="sm_lookup", expanded=True)
 
 # ============================== ABOUT PAGE ================================
 else:
