@@ -808,8 +808,7 @@ def sm_get_snapshot_rows(symbol):
     rows = [
         row('EPS', ['EPS']),
         row('OPM', ['OPM', 'Operating Profit Margin'], points=True),
-        row('Revenue', ['Sales', 'Revenue', 'Total Revenue']),
-        row('Sales Growth', ['Sales', 'Revenue']),
+        row('Sales Growth', ['Sales', 'Revenue', 'Total Revenue']),
         row('PAT', ['Net Profit', 'PAT', 'Profit after tax']),
         row('PBT', ['Profit before tax', 'PBT']),
         row('EBITDA', ['Operating Profit', 'EBITDA']),
@@ -1317,8 +1316,8 @@ def sm_build_result_row(r):
     }
 
 
-def sm_render_snapshot_widget(symbol, key_prefix, expanded=False):
-    with st.expander("📋 Fundamental snapshot", expanded=expanded):
+def sm_render_snapshot_widget(symbol, key_prefix, expanded=False, title="📋 Fundamental snapshot"):
+    with st.expander(title, expanded=expanded):
         cap_col, btn_col = st.columns([6, 1])
         with cap_col:
             st.caption("Auto-loads from screener.in (cached ~6 hours — repeat views are instant).")
@@ -1332,6 +1331,36 @@ def sm_render_snapshot_widget(symbol, key_prefix, expanded=False):
             st.dataframe(pd.DataFrame(snap_rows), use_container_width=True, hide_index=True)
         else:
             st.warning("Snapshot data nahi mila (screener.in se fetch fail ya symbol invalid).")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def sm_compute_score_for_symbol(base_symbol: str, breakout_near_pct: float = 2.0) -> Optional[Dict[str, Any]]:
+    """Computes the Smart Scanner's Momentum/Trend/Strength score + breakout
+    read for a single symbol on demand.
+
+    This lets the *unified* stock-detail view show Smart Scanner's read on a
+    stock even when that stock was opened from the plain Scanner page (i.e.
+    it wasn't necessarily part of a completed Smart Scanner run). base_symbol
+    should be the bare NSE symbol (no '.NS' suffix)."""
+    try:
+        df = yf.Ticker(base_symbol + ".NS").history(period="6mo", interval="1d", auto_adjust=True)
+        if df is None or len(df) < 50:
+            return None
+        score = sm_compute_momentum_score(df)
+        if not score:
+            return None
+        breakout = sm_detect_breakout(df, near_pct=breakout_near_pct)
+        return {
+            'symbol': base_symbol, **score,
+            'selected_via': [],
+            'breakout_type': breakout['breakout_type'],
+            'breakout_details': breakout['details'],
+            'resistance_level': breakout.get('resistance_level', ''),
+            'trendline_level': breakout.get('trendline_level', ''),
+            'fund_reasons': [], 'fund_data': {},
+        }
+    except Exception:
+        return None
 
 
 # ============================================================================
@@ -2795,7 +2824,7 @@ def _data_table(headers, rows, col_widths):
     return tbl
 
 
-def build_stock_report(candidate: dict) -> bytes:
+def build_stock_report(candidate: dict, smart: Optional[Dict[str, Any]] = None) -> bytes:
     buf = BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
@@ -2969,6 +2998,63 @@ def build_stock_report(candidate: dict) -> bytes:
     ]
     story.append(_kv_grid(adv_rows, content_w / 3))
     story.append(Spacer(1, 12))
+
+    # ---------------------------------------------------------------
+    # Smart Scanner Insights (mirrors the on-screen "🎯 Smart Scanner
+    # Insights (Momentum / Trend / Strength)" section)
+    # ---------------------------------------------------------------
+    story.append(Paragraph(
+        f"Smart Scanner Insights <font size='8' color='{PDF_MUTED}'>(Momentum / Trend / Strength)</font>", h2,
+    ))
+    if smart:
+        story.append(_metric_row(
+            [
+                ("Final Score", f"{smart.get('finalScore', '—')}/100"),
+                ("Momentum (Osc)", str(smart.get('oscScore', '—'))),
+                ("Trend", str(smart.get('trendScore', '—'))),
+                ("Strength", str(smart.get('strengthScore', '—'))),
+            ],
+            content_w / 4,
+        ))
+        story.append(Spacer(1, 6))
+
+        sm_reasons = []
+        if smart.get('selected_via'):
+            sm_reasons.append('Selected via: ' + ', '.join(smart['selected_via']))
+        sm_reasons += smart.get('breakout_details', []) or []
+        sm_reasons += (smart.get('fund_reasons') or [])
+        sm_red_flags = sm_compute_red_flags(smart.get('fund_data') or {})
+
+        sm_reasons_col = [Paragraph(f"<font color='{PDF_GREEN}'><b>Reasons (Smart Scanner)</b></font>", h2)] + \
+            _bullet_list(sm_reasons, "No specific reasons captured.")
+        sm_flags_col = [Paragraph(f"<font color='{PDF_RED}'><b>Red Flags (Smart Scanner)</b></font>", h2)] + \
+            _bullet_list(sm_red_flags, "No red flags found.")
+        sm_rf_tbl = Table([[sm_reasons_col, sm_flags_col]], colWidths=[content_w / 2, content_w / 2])
+        sm_rf_tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(PDF_CARD)),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (0, 0), 10), ("LEFTPADDING", (1, 0), (1, 0), 14),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+            ("TOPPADDING", (0, 0), (-1, -1), 10), ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+            ("LINEBEFORE", (1, 0), (1, 0), 0.5, colors.HexColor(PDF_BORDER)),
+        ]))
+        story.append(sm_rf_tbl)
+        story.append(Spacer(1, 8))
+
+        if smart.get('breakout_type'):
+            story.append(Paragraph(f"<b>Breakout Type:</b> {', '.join(smart['breakout_type'])}", body))
+            story.append(Spacer(1, 6))
+
+        if smart.get('signal_table'):
+            sig_rows = [[s.get("Signal", "—"), s.get("Status", "—"), s.get("Detail", "—")] for s in smart['signal_table']]
+            story.append(Paragraph("Momentum/Trend/Strength Signals", h2))
+            story.append(_data_table(
+                ["Signal", "Status", "Detail"], sig_rows,
+                [content_w * 0.25, content_w * 0.25, content_w * 0.5],
+            ))
+    else:
+        story.append(Paragraph("Smart Scanner score could not be computed for this stock.", muted_italic))
+    story.append(Spacer(1, 14))
 
     # ---------------------------------------------------------------
     # Fundamental snapshot — QoQ/YoY financials (mirrors the on-screen
@@ -3250,7 +3336,23 @@ def build_price_chart(t: Dict[str, Any], symbol: str):
     return fig
 
 
-def render_stock_detail(symbol: str):
+def render_stock_detail(symbol: str, smart_result: Optional[Dict[str, Any]] = None):
+    """Unified stock detail view.
+
+    Shows everything from the plain Scanner engine (technical/fundamental
+    score, full multi-panel chart with Volume/MACD/ADX, trade plan, advanced
+    signals, screener.in financials, shareholding/delivery) PLUS everything
+    that's unique to the Smart Scanner engine (Momentum/Trend/Strength score,
+    breakout read, momentum signal table, Smart Scanner's own fundamental
+    snapshot). This same function is called from both the Scanner/Watchlist
+    pages AND the Smart Scanner page's detail view, so a stock's detail view
+    always shows the merged output of both scanners — even though each
+    scanner's *scan results list* stays independent.
+
+    `smart_result` can be passed in when the caller already has it (e.g. the
+    Smart Scanner page, right after running a scan) to avoid recomputing it;
+    otherwise it's computed on the fly from the symbol.
+    """
     with st.spinner(f"Fetching {symbol}..."):
         c = cached_stock_detail(symbol)
     if not c:
@@ -3260,6 +3362,11 @@ def render_stock_detail(symbol: str):
     t = c["technical"]
     plan = c["trade_plan"]
     setups = c.get("setups") or [c["setup_type"]]
+
+    smart = smart_result
+    if smart is None:
+        with st.spinner("Computing Smart Scanner momentum/trend/strength score..."):
+            smart = sm_compute_score_for_symbol(c["base_symbol"])
 
     top_l, top_r = st.columns([3, 1.4])
     with top_l:
@@ -3288,7 +3395,7 @@ def render_stock_detail(symbol: str):
     with b2:
         if st.button("📄 Prepare PDF Report", key=f"pdfgen_{symbol}", use_container_width=True):
             with st.spinner("Building PDF (includes shareholding/financials/delivery — first time per stock takes a moment)..."):
-                st.session_state[f"pdf_bytes_{symbol}"] = build_stock_report(c)
+                st.session_state[f"pdf_bytes_{symbol}"] = build_stock_report(c, smart)
         pdf_bytes = st.session_state.get(f"pdf_bytes_{symbol}")
         if pdf_bytes:
             st.download_button(
@@ -3334,7 +3441,46 @@ def render_stock_detail(symbol: str):
         c2c.write(f"**BB width %:** {t.get('bb_width_pct'):.1f}%" if t.get("bb_width_pct") is not None else "—")
         c3c.write(f"**Volume ratio:** {t.get('volume_ratio'):.2f}x")
 
-    with st.expander("Fundamental snapshot"):
+    st.markdown("---")
+    st.markdown("#### 🎯 Smart Scanner Insights (Momentum / Trend / Strength)")
+    if smart:
+        sm1, sm2, sm3, sm4 = st.columns(4)
+        sm1.metric("Final Score", f"{smart['finalScore']}/100")
+        sm2.metric("Momentum (Osc)", smart['oscScore'])
+        sm3.metric("Trend", smart['trendScore'])
+        sm4.metric("Strength", smart['strengthScore'])
+
+        sm_col_a, sm_col_b = st.columns(2)
+        with sm_col_a:
+            st.markdown("**✅ Reasons (Smart Scanner)**")
+            sm_reasons = []
+            if smart.get('selected_via'):
+                sm_reasons.append('Selected via: ' + ', '.join(smart['selected_via']))
+            sm_reasons += smart.get('breakout_details', [])
+            sm_reasons += (smart.get('fund_reasons') or [])
+            if sm_reasons:
+                for rr in sm_reasons:
+                    st.markdown(f"- {rr}")
+            else:
+                st.caption("No specific reasons captured.")
+        with sm_col_b:
+            st.markdown("**🚩 Red Flags (Smart Scanner)**")
+            sm_red_flags = sm_compute_red_flags(smart.get('fund_data') or {})
+            if sm_red_flags:
+                for f in sm_red_flags:
+                    st.markdown(f"- {f}")
+            else:
+                st.caption("No red flags found.")
+
+        if smart.get('breakout_type'):
+            st.write("**Breakout Type:**", ', '.join(smart['breakout_type']))
+        if smart.get('signal_table'):
+            st.write("**Momentum/Trend/Strength Signals:**")
+            st.dataframe(pd.DataFrame(smart['signal_table']), use_container_width=True, hide_index=True)
+    else:
+        st.caption("Smart Scanner score could not be computed for this stock (insufficient price history or fetch failed).")
+
+    with st.expander("📋 Fundamental snapshot (EPS/OPM/Sales/PAT/PBT/EBITDA/Cash Flow — QoQ & YoY)"):
         fin_col1, fin_col2 = st.columns([5, 1])
         fin_col1.caption("Auto-loads from screener.in (cached ~6 hours — repeat views are instant).")
         if fin_col2.button("🔄", key=f"fin_refresh_{symbol}", help="Force refresh (clears cached data for all stocks, not just this one)"):
@@ -4189,50 +4335,11 @@ elif page == "🎯 Smart Scanner":
             )
             if pick_symbol:
                 r = match_lookup[pick_symbol]
-                mc1, mc2, mc3 = st.columns(3)
-                mc1.metric("Momentum (Osc)", r['oscScore'])
-                mc2.metric("Trend", r['trendScore'])
-                mc3.metric("Strength", r['strengthScore'])
 
                 with st.spinner(f"Loading {pick_symbol} chart..."):
                     chart_df = sm_get_chart_history(pick_symbol)
-                if chart_df is not None:
-                    st.plotly_chart(sm_build_price_chart_plotly(chart_df, pick_symbol), use_container_width=True)
-                else:
-                    st.caption("Chart data load nahi ho paya.")
 
-                col_a, col_b = st.columns(2)
-                fund_data = r.get('fund_data', {}) or {}
-                red_flags = sm_compute_red_flags(fund_data)
-                with col_a:
-                    st.markdown("#### ✅ Reasons")
-                    reasons = []
-                    if r.get('selected_via'):
-                        reasons.append('Selected via: ' + ', '.join(r['selected_via']))
-                    reasons += r.get('breakout_details', [])
-                    reasons += (r.get('fund_reasons') or [])
-                    if reasons:
-                        for rr in reasons:
-                            st.markdown(f"- {rr}")
-                    else:
-                        st.caption("No specific reasons captured.")
-                with col_b:
-                    st.markdown("#### 🚩 Red Flags")
-                    if red_flags:
-                        for f in red_flags:
-                            st.markdown(f"- {f}")
-                    else:
-                        st.caption("No red flags found.")
-
-                if r.get('signal_table'):
-                    st.write("**Technical Signals:**")
-                    st.dataframe(pd.DataFrame(r['signal_table']), use_container_width=True, hide_index=True)
-                if r.get('breakout_type'):
-                    st.write("**Breakout Type:**", ', '.join(r['breakout_type']))
-
-                sm_render_snapshot_widget(r['symbol'], key_prefix=f"sm_match_{r['symbol']}")
-
-                if st.button("📄 Download PDF Report", key=f"sm_pdf_btn_{pick_symbol}"):
+                if st.button("📄 Download Smart Scanner PDF Report", key=f"sm_pdf_btn_{pick_symbol}"):
                     with st.spinner("PDF bana raha hai..."):
                         chart_png = sm_build_price_chart_image(chart_df, pick_symbol) if chart_df is not None else None
                         pdf_bytes = sm_build_stock_pdf(r, chart_png)
@@ -4241,6 +4348,15 @@ elif page == "🎯 Smart Scanner":
                         file_name=f"{pick_symbol}_report_{datetime.now().strftime('%d-%m-%Y')}.pdf",
                         mime="application/pdf", key=f"sm_pdf_dl_{pick_symbol}",
                     )
+
+                st.markdown("---")
+                st.caption(
+                    "👇 Full unified detail view — same as the Scanner page: technical + "
+                    "fundamental score, detailed chart (Volume/MACD/ADX), trade plan, "
+                    "advanced signals, financials, shareholding/delivery — merged with "
+                    "the Smart Scanner momentum/trend/strength read above."
+                )
+                render_stock_detail(f"{pick_symbol}.NS", smart_result=r)
         elif momentum_hits and not matches:
             st.warning(
                 "Momentum/breakout filter mein stocks aaye, par fundamentals mein koi pass nahi hua. "
