@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import io
+import re
 import calendar
 import tempfile
 import threading
@@ -53,6 +54,148 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import Image as RLImage, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+# ============================================================================
+# DATA RELIABILITY LAYER
+# ----------------------------------------------------------------------------
+# Centralises Yahoo/Screener network access so all scanners share retry,
+# backoff, throttling and in-process caching. A failed live request can fall
+# back to a recent cached value instead of silently killing a scan.
+# ============================================================================
+
+_YF_MIN_INTERVAL = 0.35
+_SCREENER_MIN_INTERVAL = 1.25
+_YF_LOCK = threading.Lock()
+_SCREENER_LOCK = threading.Lock()
+_YF_LAST_REQUEST = 0.0
+_SCREENER_LAST_REQUEST = 0.0
+
+_DATA_HEALTH = {
+    "yahoo": {"ok": 0, "failed": 0, "last_error": "", "last_ok": None},
+    "screener": {"ok": 0, "failed": 0, "last_error": "", "last_ok": None},
+}
+
+
+def _throttle(lock, last_key: str, min_interval: float) -> None:
+    global _YF_LAST_REQUEST, _SCREENER_LAST_REQUEST
+    with lock:
+        last = _YF_LAST_REQUEST if last_key == "yahoo" else _SCREENER_LAST_REQUEST
+        wait = min_interval - (_time.monotonic() - last)
+        if wait > 0:
+            _time.sleep(wait)
+        now = _time.monotonic()
+        if last_key == "yahoo":
+            _YF_LAST_REQUEST = now
+        else:
+            _SCREENER_LAST_REQUEST = now
+
+
+def _record_health(source: str, ok: bool, error: str = "") -> None:
+    h = _DATA_HEALTH[source]
+    if ok:
+        h["ok"] += 1
+        h["last_ok"] = datetime.now().isoformat(timespec="seconds")
+    else:
+        h["failed"] += 1
+        h["last_error"] = str(error)[:250]
+
+
+def get_data_health() -> Dict[str, Any]:
+    return {k: dict(v) for k, v in _DATA_HEALTH.items()}
+
+
+def _yf_history_with_retry(symbol: str, period: str = "1y", auto_adjust: bool = False,
+                           retries: int = 3) -> Optional[pd.DataFrame]:
+    """Single gateway for yfinance history calls. Retries transient failures
+    with exponential backoff and returns None only after all attempts fail."""
+    last_error = ""
+    for attempt in range(retries):
+        try:
+            _throttle(_YF_LOCK, "yahoo", _YF_MIN_INTERVAL)
+            hist = yf.Ticker(symbol).history(
+                period=period, interval="1d", auto_adjust=auto_adjust, timeout=15
+            )
+            if hist is not None and not hist.empty:
+                _record_health("yahoo", True)
+                return hist
+            last_error = "empty dataframe"
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+        if attempt < retries - 1:
+            _time.sleep(min(8.0, 1.0 * (2 ** attempt)))
+    _record_health("yahoo", False, last_error)
+    return None
+
+
+def _yf_info_with_retry(symbol: str, retries: int = 2) -> Dict[str, Any]:
+    """Best-effort Yahoo metadata gateway. Metadata failure must never abort
+    a technical scan; callers receive an empty dict on failure."""
+    last_error = ""
+    for attempt in range(retries):
+        try:
+            _throttle(_YF_LOCK, "yahoo", _YF_MIN_INTERVAL)
+            info = yf.Ticker(symbol).info or {}
+            if isinstance(info, dict):
+                _record_health("yahoo", True)
+                return info
+            last_error = "non-dict info"
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+        if attempt < retries - 1:
+            _time.sleep(min(6.0, 1.0 * (2 ** attempt)))
+    _record_health("yahoo", False, last_error)
+    return {}
+
+
+def _screener_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=2, connect=2, read=2, status=2,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.screener.in/",
+    })
+    return session
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def _get_screener_html_cached(symbol: str) -> Optional[str]:
+    """One cached Screener page per symbol, with throttling and retry.
+    Consolidated page is preferred; standalone page is the fallback."""
+    base = symbol.replace(".NS", "").strip().upper()
+    session = _screener_session()
+    last_error = ""
+    for url in (
+        f"https://www.screener.in/company/{base}/consolidated/",
+        f"https://www.screener.in/company/{base}/",
+    ):
+        try:
+            _throttle(_SCREENER_LOCK, "screener", _SCREENER_MIN_INTERVAL)
+            resp = session.get(url, timeout=(8, 20))
+            if resp.status_code == 200 and resp.text and len(resp.text) > 1000:
+                _record_health("screener", True)
+                return resp.text
+            last_error = f"HTTP {resp.status_code}"
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+    _record_health("screener", False, last_error)
+    return None
+
 
 
 # ============================================================================
@@ -335,15 +478,8 @@ def _seasonal_cache_age_days(ticker: str) -> float:
 def _seasonal_download_fresh(ticker: str, years_back: int) -> Optional[pd.DataFrame]:
     """Yfinance se fresh data download karta hai (network call)."""
     try:
-        df = yf.download(
-            ticker, period=f"{years_back + 1}y",
-            auto_adjust=True, progress=False, threads=False,
-        )
-        if df is None or df.empty:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] for c in df.columns]
-        if "Close" not in df.columns:
+        df = _yf_history_with_retry(ticker, period=f"{years_back + 1}y", auto_adjust=True)
+        if df is None or df.empty or "Close" not in df.columns:
             return None
         df = df.dropna(subset=["Close"])
         return df[["Close"]] if not df.empty else None
@@ -548,28 +684,10 @@ def sm_resolve_universe(universe_label: str, use_live_nse: bool):
 
 # ---- Fundamental filters — Screener.in scraper ----------------------------
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def sm_fetch_screener_html(symbol):
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                      'AppleWebKit/537.36 (KHTML, like Gecko) '
-                      'Chrome/124.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.screener.in/',
-    })
-    urls = [
-        f'https://www.screener.in/company/{symbol}/consolidated/',
-        f'https://www.screener.in/company/{symbol}/',
-    ]
-    for url in urls:
-        try:
-            r = session.get(url, timeout=12)
-            if r.status_code == 200:
-                return r.text
-        except Exception:
-            continue
-    return None
+    # Backward-compatible wrapper: all callers now share the same cached
+    # Screener gateway.
+    return _get_screener_html_cached(symbol)
 
 
 def sm_parse_table(soup, section_id):
@@ -1130,7 +1248,7 @@ def sm_compute_red_flags(fd: dict) -> list:
 @st.cache_data(ttl=15 * 60, show_spinner=False)
 def sm_get_chart_history(symbol: str, period: str = "1y"):
     try:
-        df = yf.Ticker(symbol + ".NS").history(period=period, interval="1d", auto_adjust=True)
+        df = _yf_history_with_retry(symbol + ".NS", period=period, auto_adjust=True)
         if df is None or df.empty or len(df) < 30:
             return None
         df = df.copy()
@@ -1343,7 +1461,7 @@ def sm_compute_score_for_symbol(base_symbol: str, breakout_near_pct: float = 2.0
     it wasn't necessarily part of a completed Smart Scanner run). base_symbol
     should be the bare NSE symbol (no '.NS' suffix)."""
     try:
-        df = yf.Ticker(base_symbol + ".NS").history(period="6mo", interval="1d", auto_adjust=True)
+        df = _yf_history_with_retry(base_symbol + ".NS", period="6mo", auto_adjust=True)
         if df is None or len(df) < 50:
             return None
         score = sm_compute_momentum_score(df)
@@ -2005,16 +2123,17 @@ def compute_trade_plan(t: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================================
 
 def _fetch_one(symbol: str, period: str = "1y") -> Optional[Dict[str, Any]]:
+    """Fetch the minimum data needed for the main scanner.
+
+    Important: `.info` is intentionally not fetched here. It is a heavyweight
+    Yahoo endpoint and used to multiply requests during large scans.
+    Technical scanning should work even when metadata is temporarily absent.
+    """
     try:
-        tk = yf.Ticker(symbol)
-        hist = tk.history(period=period, interval="1d", auto_adjust=False)
+        hist = _yf_history_with_retry(symbol, period=period, auto_adjust=False)
         if hist is None or hist.empty or len(hist) < 30:
             return None
-        info = {}
-        try:
-            info = tk.info or {}
-        except Exception:
-            info = {}
+        info = _yf_info_with_retry(symbol)
         return {"symbol": symbol, "history": hist, "info": info}
     except Exception:
         return None
@@ -2140,6 +2259,92 @@ def fetch_stock_detail(symbol: str, period: str = "1y") -> Optional[Dict[str, An
 
 
 # ============================================================================
+# SECTION 3A: multi_scanner.py — Scanner ∩ Smart Scanner combined engine
+# ----------------------------------------------------------------------------
+# Runs BOTH engines for every symbol — the plain Scanner's Technical+
+# Fundamental engine (via _fetch_one/_analyze_one, same as run_scan) and the
+# Smart Scanner's Momentum/Trend/Strength + Breakout engine (via
+# sm_compute_score_for_symbol, same as the Smart Scanner page) — and keeps
+# only the symbols that pass BOTH sets of filters. Each engine uses its own
+# native fetch (different period/adjust settings), so a stock's Multi
+# Scanner scores always match exactly what each scanner would report if run
+# standalone — this is a pure intersection, not a new scoring model.
+# ============================================================================
+
+def _multi_fetch_and_score(symbol_ns: str, breakout_near_pct: float) -> Optional[Dict[str, Any]]:
+    base = symbol_ns.replace(".NS", "")
+    scanner_data = _fetch_one(symbol_ns, period="1y")
+    if not scanner_data:
+        return None
+    candidate = _analyze_one(symbol_ns, scanner_data)
+    if not candidate:
+        return None
+    smart = sm_compute_score_for_symbol(base, breakout_near_pct=breakout_near_pct)
+    if not smart:
+        return None
+    return {"candidate": candidate, "smart": smart}
+
+
+def run_multi_scan(
+    tickers: List[str],
+    filters: Dict[str, Any],
+    sm_filters: Dict[str, Any],
+    progress_cb: Callable[[Dict[str, Any]], None],
+    max_workers: int = 8,
+) -> List[Dict[str, Any]]:
+    total = len(tickers)
+    results = []
+    processed = 0
+    started = _time.time()
+    breakout_near_pct = sm_filters.get("breakout_near_pct", 2.0)
+
+    progress_cb({
+        "type": "start", "total": total, "processed": 0,
+        "message": f"Starting multi-scan of {total} tickers (both engines)...",
+    })
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_multi_fetch_and_score, sym, breakout_near_pct): sym for sym in tickers}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            processed += 1
+            try:
+                out = fut.result()
+                if out:
+                    candidate, smart = out["candidate"], out["smart"]
+                    scanner_ok = _passes_filters(candidate, filters)
+                    sm_min, sm_max = sm_filters.get("score_range", (0, 100))
+                    momentum_ok = sm_min <= smart["finalScore"] <= sm_max
+                    require_breakout = sm_filters.get("require_breakout", False)
+                    breakout_ok = (not require_breakout) or bool(smart.get("breakout_type"))
+                    if scanner_ok and momentum_ok and breakout_ok:
+                        merged = dict(candidate)
+                        merged["smart"] = smart
+                        results.append(merged)
+                progress_cb({
+                    "type": "progress", "total": total, "processed": processed,
+                    "current_symbol": sym, "matches": len(results),
+                    "elapsed": round(_time.time() - started, 1),
+                })
+            except Exception as e:
+                progress_cb({
+                    "type": "progress", "total": total, "processed": processed,
+                    "current_symbol": sym, "matches": len(results), "error": str(e),
+                    "elapsed": round(_time.time() - started, 1),
+                })
+
+    def combined(r):
+        return (
+            r["technical_score"] / 100 * 0.3
+            + r["fundamental_score"] / 100 * 0.2
+            + r["smart"]["finalScore"] / 100 * 0.5
+        )
+
+    results.sort(key=combined, reverse=True)
+    return results
+
+
+# ============================================================================
 # SECTION 3B: nse_extra.py — Promoter/FII/DII/Public holding + Bulk/Block deals
 # ----------------------------------------------------------------------------
 # Uses the `nse` PyPI package (BennyThadikaran/NseIndiaApi) instead of hand-
@@ -2220,30 +2425,9 @@ def fetch_nse_debug(symbol: str) -> Dict[str, Any]:
     return results
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
 def _fetch_screener_soup(symbol: str) -> Optional[str]:
-    """Fetch screener.in's company page HTML once per symbol (cached), reused
-    by shareholding, quarterly/annual financials, etc. — avoids re-downloading
-    the same page for every feature that needs it. Returns raw HTML text
-    (BeautifulSoup objects aren't cache-friendly/picklable) — callers should
-    parse it with BeautifulSoup themselves."""
-    base = symbol.replace(".NS", "")
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.screener.in/",
-    })
-    for url in (f"https://www.screener.in/company/{base}/consolidated/",
-                f"https://www.screener.in/company/{base}/"):
-        try:
-            resp = session.get(url, timeout=12)
-            if resp.status_code == 200:
-                return resp.text
-        except Exception:
-            continue
-    return None
+    # Single source of truth for all Screener consumers.
+    return _get_screener_html_cached(symbol)
 
 
 def _parse_screener_table(html: str, section_id: str) -> Dict[str, List[Optional[float]]]:
@@ -3167,6 +3351,257 @@ def build_stock_report(candidate: dict, smart: Optional[Dict[str, Any]] = None) 
     doc.build(story, onFirstPage=_pdf_bg_painter, onLaterPages=_pdf_bg_painter)
     buf.seek(0)
     return buf.getvalue()
+
+
+# ============================================================================
+# SECTION 4B: news_scanner.py — NewsAPI-based good/bad news scoring
+# ----------------------------------------------------------------------------
+# Ported from app.py (Stock News Scanner). Fetches recent headlines for a
+# stock from a fixed set of Indian financial news sites (via NewsAPI.org),
+# tags each article's category (earnings/deals/movement/regulation/other),
+# scores sentiment with a weighted keyword+negation model, and flags whether
+# the category is one that typically moves price. Everything here is
+# prefixed `news_` to avoid clashing with the rest of the app.
+# ============================================================================
+
+NEWSAPI_KEY = "86ab6113817d49e8a49a0686fa9b4a75"
+
+NEWS_INDIAN_SOURCES = [
+    'economictimes.indiatimes.com',
+    'livemint.com',
+    'moneycontrol.com',
+    'business-standard.com',
+    'financialexpress.com',
+    'thehindubusinessline.com',
+]
+
+NEWS_COMPANY_NAMES = {
+    'RELIANCE': 'Reliance Industries Ltd', 'TCS': 'Tata Consultancy Services',
+    'INFY': 'Infosys Ltd', 'HDFCBANK': 'HDFC Bank Ltd', 'ICICIBANK': 'ICICI Bank Ltd',
+    'BHARTIARTL': 'Bharti Airtel Ltd', 'ITC': 'ITC Ltd', 'SBIN': 'State Bank of India',
+    'LT': 'Larsen & Toubro Ltd', 'HINDUNILVR': 'Hindustan Unilever Ltd',
+    'KOTAKBANK': 'Kotak Mahindra Bank', 'BAJFINANCE': 'Bajaj Finance Ltd',
+    'MARUTI': 'Maruti Suzuki India Ltd', 'WIPRO': 'Wipro Ltd', 'ADANIENT': 'Adani Enterprises Ltd',
+    'ONGC': 'Oil & Natural Gas Corp', 'TATAMOTORS': 'Tata Motors Ltd',
+    'SUNPHARMA': 'Sun Pharmaceutical Ind', 'NTPC': 'NTPC Ltd', 'POWERGRID': 'Power Grid Corp of India',
+    'ULTRACEMCO': 'UltraTech Cement Ltd', 'NESTLEIND': 'Nestle India Ltd', 'TITAN': 'Titan Company Ltd',
+    'TECHM': 'Tech Mahindra Ltd', 'HCLTECH': 'HCL Technologies Ltd', 'TATASTEEL': 'Tata Steel Ltd',
+}
+
+NEWS_CATEGORY_KEYWORDS = {
+    'earnings': ['earnings', 'profit', 'revenue', 'results', 'quarterly',
+                 'q1', 'q2', 'q3', 'q4', 'net profit', 'ebitda', 'guidance', 'margin'],
+    'deals': ['merger', 'acquisition', 'deal', 'mou', 'partnership',
+              'joint venture', 'collaboration', 'agreement', 'stake sale',
+              'contract win', 'order win', 'bags order', 'bags contract',
+              'wins order', 'wins contract', 'awarded contract'],
+    'movement': ['rises', 'falls', 'gains', 'drops', 'surge', 'plunge',
+                 'rally', 'decline', 'hits', 'touches', 'breaks', 'upper circuit', 'lower circuit'],
+    'regulation': ['sebi', 'rbi', 'regulation', 'compliance', 'penalty',
+                   'investigation', 'norms', 'policy', 'government', 'ban', 'probe', 'raid'],
+}
+NEWS_IMPACT_PRONE_CATEGORIES = {'earnings', 'deals', 'movement', 'regulation'}
+NEWS_CATEGORY_PRIORITY = ['earnings', 'deals', 'movement', 'regulation', 'other']
+
+NEWS_POSITIVE_WORDS = {
+    'record profit': 3, 'all-time high': 3, 'beats estimates': 3, 'beat estimates': 3,
+    'blowout quarter': 3, 'multi-year high': 3, 'buyback': 3, 'special dividend': 3,
+    'debt-free': 3, 'turnaround': 3, 'upper circuit': 3,
+    'surge': 2, 'soars': 2, 'jumps': 2, 'rally': 2, 'upgrade': 2, 'upgraded': 2,
+    'strong growth': 2, 'robust': 2, 'bullish': 2, 'outperform': 2, 'raises guidance': 2,
+    'wins order': 2, 'bags order': 2, 'bags contract': 2, 'expansion': 2, 'stake buy': 2,
+    'dividend': 2, 'profit rises': 2, 'net profit up': 2,
+    'gains': 1, 'growth': 1, 'profit': 1, 'wins': 1, 'won': 1, 'raises': 1,
+    'strong': 1, 'positive': 1, 'improves': 1, 'higher': 1, 'up': 1,
+}
+
+NEWS_NEGATIVE_WORDS = {
+    'fraud': 3, 'scam': 3, 'bankruptcy': 3, 'insolvency': 3, 'default': 3,
+    'crashes': 3, 'plunges': 3, 'multi-year low': 3, 'raid': 3, 'scam-hit': 3,
+    'accounting irregularities': 3, 'resigns amid': 3, 'lower circuit': 3,
+    'plunge': 2, 'falls': 2, 'decline': 2, 'downgrade': 2, 'downgraded': 2,
+    'penalty': 2, 'investigation': 2, 'probe': 2, 'lawsuit': 2, 'layoffs': 2,
+    'layoff': 2, 'slashed': 2, 'bearish': 2, 'underperform': 2, 'misses estimates': 2,
+    'missed estimates': 2, 'profit falls': 2, 'net profit down': 2, 'resigns': 2,
+    'ban': 2, 'slump': 2,
+    'loss': 1, 'weak': 1, 'cut': 1, 'lower': 1, 'negative': 1, 'concerns': 1,
+    'pressure': 1, 'drops': 1, 'down': 1,
+}
+
+NEWS_NEGATION_TRIGGERS = ['not ', 'no ', "n't ", 'never ', 'without ', 'fails to ', 'failed to ', 'unable to ']
+
+
+def _news_compile_patterns(phrases) -> dict:
+    return {phrase: re.compile(r'\b' + re.escape(phrase) + r'\b') for phrase in phrases}
+
+
+_NEWS_CATEGORY_PATTERNS = {cat: _news_compile_patterns(terms) for cat, terms in NEWS_CATEGORY_KEYWORDS.items()}
+_NEWS_POSITIVE_PATTERNS = {phrase: (_news_compile_patterns([phrase])[phrase], weight) for phrase, weight in NEWS_POSITIVE_WORDS.items()}
+_NEWS_NEGATIVE_PATTERNS = {phrase: (_news_compile_patterns([phrase])[phrase], weight) for phrase, weight in NEWS_NEGATIVE_WORDS.items()}
+
+
+def _news_is_negated(text: str, match_idx: int, phrase_len: int, window: int = 30) -> bool:
+    prefix = text[max(0, match_idx - window):match_idx]
+    suffix = text[match_idx + phrase_len: match_idx + phrase_len + window]
+    return any(trigger in prefix for trigger in NEWS_NEGATION_TRIGGERS) or \
+           any(trigger in suffix for trigger in NEWS_NEGATION_TRIGGERS)
+
+
+def _news_tag_category(text: str) -> str:
+    scores = {}
+    for category, patterns in _NEWS_CATEGORY_PATTERNS.items():
+        hits = sum(1 for pattern in patterns.values() if pattern.search(text))
+        if hits:
+            scores[category] = hits
+    if not scores:
+        return 'other'
+    best_score = max(scores.values())
+    tied = [c for c, s in scores.items() if s == best_score]
+    for category in NEWS_CATEGORY_PRIORITY:
+        if category in tied:
+            return category
+    return tied[0]
+
+
+def _news_score_sentiment(text: str):
+    score = 0
+    for phrase, (pattern, weight) in _NEWS_POSITIVE_PATTERNS.items():
+        m = pattern.search(text)
+        if m:
+            score += -weight if _news_is_negated(text, m.start(), len(phrase)) else weight
+    for phrase, (pattern, weight) in _NEWS_NEGATIVE_PATTERNS.items():
+        m = pattern.search(text)
+        if m:
+            score += weight if _news_is_negated(text, m.start(), len(phrase)) else -weight
+
+    sentiment = 'good' if score > 0 else ('bad' if score < 0 else 'neutral')
+    magnitude = abs(score)
+    confidence = 'low' if magnitude <= 1 else ('medium' if magnitude <= 3 else 'high')
+    return sentiment, score, confidence
+
+
+def _news_price_impact_reason(category: str, sentiment: str, confidence: str) -> tuple:
+    if category in NEWS_IMPACT_PRONE_CATEGORIES:
+        if sentiment == 'good':
+            return True, f"{category.capitalize()} news, positive tone ({confidence} confidence) — is tarah ki headline aksar price ko upar push karti hai."
+        if sentiment == 'bad':
+            return True, f"{category.capitalize()} news, negative tone ({confidence} confidence) — is tarah ki headline aksar price ko neeche push karti hai."
+        return True, f"{category.capitalize()} news — ye category bina clear tone ke bhi price move kara sakti hai."
+    return False, "General/background mention — price pe akela bada asar unlikely."
+
+
+@st.cache_data(show_spinner=False, ttl=15 * 60)
+def news_fetch_articles(symbol: str, api_key: str, company_name: str = None,
+                         days: int = 3, page_size: int = 10) -> list:
+    company_name = company_name or NEWS_COMPANY_NAMES.get(symbol.upper(), symbol.upper())
+    params = {
+        'q': f'"{symbol}" OR "{company_name}"',
+        'language': 'en',
+        'domains': ','.join(NEWS_INDIAN_SOURCES),
+        'sortBy': 'publishedAt',
+        'from': (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d'),
+        'pageSize': page_size,
+        'apiKey': api_key,
+    }
+    try:
+        resp = requests.get("https://newsapi.org/v2/everything", params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        return [
+            {
+                'title': a.get('title', ''),
+                'description': a.get('description', '') or '',
+                'url': a.get('url', ''),
+                'source': a.get('source', {}).get('name', ''),
+                'published': a.get('publishedAt', ''),
+            }
+            for a in data.get('articles', [])
+        ]
+    except requests.exceptions.RequestException as e:
+        st.error(f"News fetch failed: {e}")
+        return []
+
+
+def news_get_analysis(symbol: str, api_key: str, days: int = 3) -> dict:
+    symbol = symbol.upper()
+    articles = news_fetch_articles(symbol, api_key, days=days)
+
+    if not articles:
+        return {
+            'symbol': symbol, 'article_count': 0, 'overall_sentiment': 'no_news',
+            'overall_score': 0, 'overall_confidence': 'low', 'likely_price_impact_today': False,
+            'good_news': [], 'bad_news': [], 'neutral_news': [],
+        }
+
+    good_news, bad_news, neutral_news = [], [], []
+    any_impact = False
+    total_score = 0
+
+    for a in articles:
+        text = (a['title'] + ' ' + a['description']).lower()
+        category = _news_tag_category(text)
+        sentiment, score, confidence = _news_score_sentiment(text)
+        impact, reason = _news_price_impact_reason(category, sentiment, confidence)
+        any_impact = any_impact or impact
+        total_score += score
+
+        item = {
+            'title': a['title'], 'source': a['source'], 'url': a['url'],
+            'category': category, 'sentiment_score': score, 'confidence': confidence,
+            'likely_price_impact': impact, 'reason': reason,
+        }
+
+        (good_news if sentiment == 'good' else bad_news if sentiment == 'bad' else neutral_news).append(item)
+
+    overall = 'good' if total_score > 0 else ('bad' if total_score < 0 else 'neutral')
+    overall_magnitude = abs(total_score)
+    overall_confidence = 'low' if overall_magnitude <= 1 else ('medium' if overall_magnitude <= 4 else 'high')
+
+    return {
+        'symbol': symbol, 'article_count': len(articles), 'overall_sentiment': overall,
+        'overall_score': total_score, 'overall_confidence': overall_confidence,
+        'likely_price_impact_today': any_impact,
+        'good_news': good_news, 'bad_news': bad_news, 'neutral_news': neutral_news,
+    }
+
+
+def news_scan_top_bullish(symbols: list, api_key: str, days: int = 3) -> list:
+    """Scan a list of symbols and return only those with genuinely good/positive
+    news, sorted with the strongest positive news first. One NewsAPI call per
+    symbol — this is a headline-tone signal, not a price prediction."""
+    results = []
+    for symbol in symbols:
+        analysis = news_get_analysis(symbol, api_key=api_key, days=days)
+        if analysis["article_count"] == 0:
+            continue
+        if analysis["overall_sentiment"] == "good":
+            top_article = max(analysis["good_news"], key=lambda a: a["sentiment_score"])
+            results.append({
+                'symbol': analysis['symbol'],
+                'company_name': NEWS_COMPANY_NAMES.get(analysis['symbol'], analysis['symbol']),
+                'overall_score': analysis['overall_score'],
+                'overall_confidence': analysis['overall_confidence'],
+                'likely_price_impact_today': analysis['likely_price_impact_today'],
+                'article_count': analysis['article_count'],
+                'good_news_count': len(analysis['good_news']),
+                'top_headline': top_article['title'],
+                'top_headline_url': top_article['url'],
+                'top_headline_reason': top_article['reason'],
+            })
+    results.sort(key=lambda r: r['overall_score'], reverse=True)
+    return results
+
+
+def render_news_article_card(item: dict):
+    with st.container(border=True):
+        st.markdown(f"**{item['title']}**")
+        st.caption(f"{item['source']} · {item['category'].capitalize()} · "
+                   f"score {item['sentiment_score']} · {item['confidence']} confidence")
+        st.write(item["reason"])
+        if item["url"]:
+            st.markdown(f"[Read full article →]({item['url']})")
+
+
 # ============================================================================
 # SECTION 5: lightweight local persistence (drop-in replacement for MongoDB)
 # Watchlist / notes / alerts / past scans are saved to data.json next to this
@@ -3618,7 +4053,7 @@ st.sidebar.caption("Unified Engine — merged from both scanners")
 if "_pending_nav" in st.session_state:
     st.session_state["nav_page"] = st.session_state.pop("_pending_nav")
 
-page = st.sidebar.radio("Navigate", ["🔍 Scanner", "⭐ Watchlist", "📢 Bulk/Block Deals", "📅 Seasonal Scanner", "🎯 Smart Scanner", "ℹ️ About"], label_visibility="collapsed", key="nav_page")
+page = st.sidebar.radio("Navigate", ["🔍 Scanner", "⭐ Watchlist", "📢 Bulk/Block Deals", "📅 Seasonal Scanner", "🎯 Smart Scanner", "🧬 Multi Scanner", "📰 News", "ℹ️ About"], label_visibility="collapsed", key="nav_page")
 
 st.sidebar.markdown("---")
 
@@ -4250,7 +4685,7 @@ elif page == "🎯 Smart Scanner":
         for i, sym in enumerate(stocks_to_scan, 1):
             prog1.progress(i / total, text=f"Scanning {sym} ({i}/{total})")
             try:
-                df = yf.Ticker(sym + ".NS").history(period="6mo", interval="1d", auto_adjust=True)
+                df = _yf_history_with_retry(sym + ".NS", period="6mo", auto_adjust=True)
                 if df is None or len(df) < 50:
                     continue
                 score = sm_compute_momentum_score(df)
@@ -4377,8 +4812,289 @@ elif page == "🎯 Smart Scanner":
     if sm_lookup_go and sm_lookup_symbol.strip():
         sm_render_snapshot_widget(sm_lookup_symbol.strip().upper(), key_prefix="sm_lookup", expanded=True)
 
+# ============================== MULTI SCANNER PAGE =========================
+elif page == "🧬 Multi Scanner":
+    st.title("🧬 Multi Scanner — Scanner ∩ Smart Scanner")
+    st.caption(
+        "Yeh dono engines ek saath chalata hai — plain **Scanner** ka Technical+Fundamental "
+        "engine, aur **Smart Scanner** ka Momentum/Trend/Strength + Breakout engine — aur "
+        "sirf wahi stocks dikhata hai jo **dono** ke criteria pass karte hain (double-confirmed "
+        "setups). Original **Scanner** aur **Smart Scanner** pages bilkul waise hi alag-alag "
+        "kaam karte rehte hain — kuch change nahi hua unme."
+    )
+
+    with st.form("multi_scanner_form"):
+        st.markdown("##### Universe")
+        mu1, mu2 = st.columns(2)
+        multi_universe_label = mu1.selectbox(
+            "Universe", ["Nifty 50", "Nifty 200", "Nifty 500", "Full NSE Cash Segment (slow, 1500+ stocks)"],
+            index=1, key="multi_universe",
+        )
+        multi_use_live_nse = mu2.checkbox(
+            "Fetch live list from NSE", value=True, key="multi_use_live",
+            help="Downloads the current constituent list directly from nseindia.com. "
+                 "Falls back to the built-in list if NSE blocks the request.",
+        )
+
+        st.markdown("##### Scanner engine filters (Technical + Fundamental)")
+        ms1, ms2 = st.columns(2)
+        multi_min_tech = ms1.slider("Min technical score", 0, 100, 65, key="multi_min_tech")
+        multi_min_fund = ms2.slider("Min fundamental score", 0, 100, 55, key="multi_min_fund")
+
+        st.markdown("##### Smart Scanner engine filters (Momentum + Breakout)")
+        mm1, mm2 = st.columns(2)
+        multi_score_min, multi_score_max = mm1.slider(
+            "Momentum Score Range", 0, 100, (75, 100), 1, key="multi_score_range",
+        )
+        multi_breakout_near_pct = mm2.slider(
+            "Breakout Near %", 0.5, 10.0, 2.0, 0.5, key="multi_breakout_pct",
+            help="Resistance/trendline ke kitne % andar aane par 'near breakout' maana jaye",
+        )
+        multi_require_breakout = st.checkbox(
+            "Sirf near-breakout / breakout wale stocks hi chahiye", value=False, key="multi_require_breakout",
+        )
+
+        multi_run_extra_fund = st.checkbox(
+            "Extra Screener.in fundamental filter bhi chalao final matches par (thoda slow, ~1.2s/stock)",
+            value=False, key="multi_extra_fund",
+        )
+        multi_top_n = st.slider("Show top N stocks", 1, 15, 5, key="multi_top_n")
+
+        multi_submitted = st.form_submit_button("🚀 Run Multi Scan", type="primary", use_container_width=True)
+
+    if multi_submitted:
+        fallback_key = {
+            "Nifty 50": "nifty50", "Nifty 200": "nifty200",
+            "Nifty 500": "nifty500", "Full NSE Cash Segment (slow, 1500+ stocks)": "nifty500",
+        }[multi_universe_label]
+
+        tickers = None
+        if multi_use_live_nse:
+            with st.spinner(f"Fetching latest {multi_universe_label} list from nseindia.com..."):
+                tickers = get_universe_live(multi_universe_label)
+            if not tickers:
+                st.warning(
+                    "Could not fetch the live list from NSE (it often blocks automated requests, "
+                    "especially from cloud hosting)."
+                )
+        if not tickers:
+            bundled = load_bundled_list(multi_universe_label)
+            if bundled:
+                tickers = bundled
+                st.caption(f"📄 Using bundled {multi_universe_label} list ({len(bundled)} symbols).")
+        if not tickers:
+            tickers = get_universe(fallback_key)
+            st.caption(f"⚠️ Falling back to the small built-in list ({len(tickers)} symbols).")
+
+        filters = {"min_technical_score": multi_min_tech, "min_fundamental_score": multi_min_fund}
+        sm_filters = {
+            "score_range": (multi_score_min, multi_score_max),
+            "breakout_near_pct": multi_breakout_near_pct,
+            "require_breakout": multi_require_breakout,
+        }
+
+        st.info(f"Scanning **{len(tickers)} stock(s)** ({multi_universe_label}) through BOTH engines...")
+
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+        matches_text = st.empty()
+
+        def multi_progress_cb(evt: Dict[str, Any]):
+            if evt["type"] == "start":
+                status_text.info(evt["message"])
+            elif evt["type"] == "progress":
+                pct = evt["processed"] / max(evt["total"], 1)
+                progress_bar.progress(min(pct, 1.0))
+                status_text.text(f"Scanned {evt['processed']}/{evt['total']} — last: {evt.get('current_symbol','')}")
+                matches_text.markdown(f"**Matches so far: {evt['matches']}**")
+
+        with st.spinner("Running both engines... har stock 2 fetches leta hai (Scanner + Smart Scanner), thoda time lagega."):
+            multi_results = run_multi_scan(tickers, filters, sm_filters, multi_progress_cb, max_workers=8)
+
+        if multi_results and multi_run_extra_fund:
+            prog2 = st.progress(0.0, text="Extra fundamental check (Screener.in)...")
+            n2 = len(multi_results)
+            kept = []
+            for i, r in enumerate(multi_results, 1):
+                prog2.progress(i / n2, text=f"Checking {r['base_symbol']} ({i}/{n2})")
+                fdata = sm_get_screener_data(r["base_symbol"])
+                passed, fund_reasons = sm_passes_fundamental_filter(fdata)
+                if passed:
+                    r["smart"]["fund_reasons"] = fund_reasons
+                    r["smart"]["fund_data"] = fdata
+                    kept.append(r)
+                _time.sleep(1.2)  # Screener.in rate-limit se bachne ke liye
+            prog2.empty()
+            multi_results = kept
+
+        progress_bar.progress(1.0)
+        status_text.success(f"Done — {len(multi_results)} stock(s) matched BOTH engines out of {len(tickers)} scanned.")
+
+        st.session_state["multi_scan_results"] = multi_results
+        st.session_state["multi_scan_top_n"] = multi_top_n
+
+    stored_multi = st.session_state.get("multi_scan_results")
+    if stored_multi:
+        top_n = st.session_state.get("multi_scan_top_n", 5)
+        results = stored_multi[:top_n]
+        st.markdown(f"### Results — showing top {len(results)} of {len(stored_multi)} match(es)")
+
+        def _multi_row(r):
+            return {
+                "Symbol": r["base_symbol"], "Name": r["name"], "Sector": r["sector"],
+                "Price (₹)": round(r["price"], 2), "Change %": round(r["change_pct"], 2),
+                "Tech Score": r["technical_score"], "Fund Score": r["fundamental_score"],
+                "Momentum": r["smart"]["finalScore"], "Trend": r["smart"]["trendScore"],
+                "Strength": r["smart"]["strengthScore"],
+                "Setups": ", ".join(SETUP_LABELS.get(s, s) for s in (r.get("setups") or [r["setup_type"]])),
+                "Breakout": ", ".join(r["smart"].get("breakout_type") or []) or "—",
+            }
+
+        df = pd.DataFrame([_multi_row(r) for r in results])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        # CSV export always contains every matched stock, not just the top-N shown above
+        df_all = pd.DataFrame([_multi_row(r) for r in stored_multi])
+        csv_bytes = df_all.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            f"⬇️ Export results to CSV ({len(stored_multi)} stock{'s' if len(stored_multi) != 1 else ''})",
+            csv_bytes, "multi_scan_results.csv", "text/csv",
+        )
+
+        symbol_options = {f"{r['base_symbol']} — {r['name']}": r["symbol"] for r in results}
+        multi_smart_lookup = {r["symbol"]: r["smart"] for r in results}
+        pick = st.selectbox("View detail for:", list(symbol_options.keys()), key="multi_detail_pick")
+        if st.button("Open detail view", key="multi_open_detail"):
+            st.session_state.selected_symbol = symbol_options[pick]
+            st.session_state["_multi_smart_cache"] = multi_smart_lookup[symbol_options[pick]]
+    else:
+        st.info(
+            "Filters set karke **Run Multi Scan** click karo. Sirf wahi stocks aayenge jo "
+            "dono engines (Scanner + Smart Scanner) pass karte hain."
+        )
+
+    if st.session_state.selected_symbol:
+        st.markdown("---")
+        cached_smart = st.session_state.pop("_multi_smart_cache", None)
+        render_stock_detail(st.session_state.selected_symbol, smart_result=cached_smart)
+
+# ============================== NEWS PAGE ==================================
+elif page == "📰 News":
+    st.title("📰 Stock News Scanner")
+    st.caption("NSE/BSE stock ka symbol daalo — good/bad news aur price-impact verdict milega.")
+
+    news_days = st.sidebar.slider("News: Look back (days)", min_value=1, max_value=7, value=3, key="news_days")
+
+    news_tab_single, news_tab_bullish = st.tabs(["🔍 Single Stock Scan", "🚀 Top Bullish Stocks"])
+
+    # ------------------------------------------------------------------
+    # Single-stock scan
+    # ------------------------------------------------------------------
+    with news_tab_single:
+        news_symbol = st.text_input(
+            "Stock Symbol", placeholder="e.g. RELIANCE, TCS, HDFCBANK", key="news_symbol_input",
+        ).strip().upper()
+        news_run = st.button("Scan News", type="primary", use_container_width=True, key="news_scan_btn")
+
+        if news_run:
+            if not news_symbol:
+                st.error("Ek stock symbol daalo (jaise RELIANCE).")
+            else:
+                with st.spinner(f"Fetching news for {news_symbol}..."):
+                    news_result = news_get_analysis(news_symbol, api_key=NEWSAPI_KEY, days=news_days)
+
+                if news_result["article_count"] == 0:
+                    st.warning(f"{news_symbol} ke liye pichle {news_days} din me koi news nahi mili.")
+                else:
+                    n_sentiment = news_result["overall_sentiment"]
+                    n_confidence = news_result["overall_confidence"]
+                    n_impact = news_result["likely_price_impact_today"]
+
+                    nc1, nc2, nc3 = st.columns(3)
+                    nc1.metric("Articles Found", news_result["article_count"])
+                    nc2.metric("Overall Sentiment", n_sentiment.upper())
+                    nc3.metric("Confidence", n_confidence.upper())
+
+                    if n_impact:
+                        st.info("📊 Price move hone ka reasonable chance hai — news category impact-prone hai.")
+                    else:
+                        st.caption("Ye news general/background type hai — price pe bada asar unlikely.")
+
+                    st.divider()
+
+                    st.subheader(f"✅ Good News ({len(news_result['good_news'])})")
+                    if news_result["good_news"]:
+                        for item in news_result["good_news"]:
+                            render_news_article_card(item)
+                    else:
+                        st.caption("Koi clearly positive headline nahi mili.")
+
+                    st.subheader(f"🔻 Bad News ({len(news_result['bad_news'])})")
+                    if news_result["bad_news"]:
+                        for item in news_result["bad_news"]:
+                            render_news_article_card(item)
+                    else:
+                        st.caption("Koi clearly negative headline nahi mili.")
+
+                    if news_result["neutral_news"]:
+                        with st.expander(f"⚪ Neutral / Unclear News ({len(news_result['neutral_news'])})"):
+                            for item in news_result["neutral_news"]:
+                                st.markdown(f"- **{item['title']}** — {item['source']} ({item['category']})")
+
+    # ------------------------------------------------------------------
+    # Scan many stocks at once, list the ones with the best news
+    # ------------------------------------------------------------------
+    with news_tab_bullish:
+        st.caption(
+            "Yaha multiple stocks ek saath scan honge, aur jin stocks me sabse positive "
+            "news mili hai unki ranked list dikhegi — top wale me sabse zyada bullish tone hai."
+        )
+        st.caption(
+            "⚠️ Ye sirf news-headline ka tone hai, price prediction nahi. "
+            "Kripya apni research/advisor se confirm kiye bina trade na karein."
+        )
+
+        news_default_watchlist = sorted(NEWS_COMPANY_NAMES.keys())
+        news_watchlist = st.multiselect(
+            "Watchlist (jin stocks ko scan karna hai)",
+            options=news_default_watchlist,
+            default=news_default_watchlist[:10],
+            help="Jitne zyada stocks select karoge, utni zyada NewsAPI calls lagengi "
+                 "(free tier me daily limit hoti hai).",
+            key="news_watchlist_select",
+        )
+        news_scan_bullish = st.button(
+            "🚀 Scan Watchlist for Best News", type="primary", use_container_width=True, key="news_bullish_btn",
+        )
+
+        if news_scan_bullish:
+            if not news_watchlist:
+                st.error("Kam se kam ek stock select karo.")
+            else:
+                with st.spinner(f"Scanning {len(news_watchlist)} stock(s) for news..."):
+                    news_bullish_list = news_scan_top_bullish(news_watchlist, api_key=NEWSAPI_KEY, days=news_days)
+
+                if not news_bullish_list:
+                    st.warning("Is watchlist me abhi kisi bhi stock ki clearly positive news nahi mili.")
+                else:
+                    st.success(f"{len(news_bullish_list)} stock(s) me positive news mili hai — best news wala sabse upar hai.")
+                    for rank, r in enumerate(news_bullish_list, start=1):
+                        badge = "🔥" if r['likely_price_impact_today'] else "📈"
+                        with st.container(border=True):
+                            st.markdown(f"### {badge} #{rank} — {r['symbol']} ({r['company_name']})")
+                            rc1, rc2, rc3 = st.columns(3)
+                            rc1.metric("Sentiment Score", r['overall_score'])
+                            rc2.metric("Confidence", r['overall_confidence'].upper())
+                            rc3.metric("Good News Articles", r['good_news_count'])
+                            if r['likely_price_impact_today']:
+                                st.info("📊 Impact-prone category — price move ka reasonable chance.")
+                            st.markdown(f"**Best headline:** {r['top_headline']}")
+                            st.caption(r['top_headline_reason'])
+                            if r['top_headline_url']:
+                                st.markdown(f"[Read full article →]({r['top_headline_url']})")
+
 # ============================== ABOUT PAGE ================================
-else:
+elif page == "ℹ️ About":
     st.title("About")
     st.markdown(
         """
