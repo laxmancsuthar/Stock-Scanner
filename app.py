@@ -4650,7 +4650,7 @@ elif page == "🎯 Smart Scanner":
             "Full NSE Cash Segment (slow, 1500+ stocks)",
             "Custom List",
         ]
-        sm_universe_choice = u1.selectbox("Universe", sm_universe_options, index=0)
+        sm_universe_choice = u1.selectbox("Universe", sm_universe_options, index=3)
         sm_custom_syms = []
         sm_use_live = True
         if sm_universe_choice == "Custom List":
@@ -4838,8 +4838,8 @@ elif page == "🧬 Multi Scanner":
 
         st.markdown("##### Scanner engine filters (Technical + Fundamental)")
         ms1, ms2 = st.columns(2)
-        multi_min_tech = ms1.slider("Min technical score", 0, 100, 65, key="multi_min_tech")
-        multi_min_fund = ms2.slider("Min fundamental score", 0, 100, 55, key="multi_min_fund")
+        multi_min_tech = ms1.slider("Min technical score", 0, 100, 70, key="multi_min_tech")
+        multi_min_fund = ms2.slider("Min fundamental score", 0, 100, 65, key="multi_min_fund")
 
         st.markdown("##### Smart Scanner engine filters (Momentum + Breakout)")
         mm1, mm2 = st.columns(2)
@@ -4856,7 +4856,7 @@ elif page == "🧬 Multi Scanner":
 
         multi_run_extra_fund = st.checkbox(
             "Extra Screener.in fundamental filter bhi chalao final matches par (thoda slow, ~1.2s/stock)",
-            value=False, key="multi_extra_fund",
+            value=True, key="multi_extra_fund",
         )
         multi_top_n = st.slider("Show top N stocks", 1, 15, 5, key="multi_top_n")
 
