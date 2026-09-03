@@ -4958,7 +4958,8 @@ elif page == "🧬 Multi Scanner":
         csv_bytes = df_all.to_csv(index=False).encode("utf-8")
         st.download_button(
             f"⬇️ Export results to CSV ({len(stored_multi)} stock{'s' if len(stored_multi) != 1 else ''})",
-            csv_bytes, "multi_scan_results.csv", "text/csv",
+            csv_bytes, f"multi_scan_results_{datetime.now().strftime('%d-%m-%Y_%H-%M')}.csv",
+    "text/csv",
         )
 
         symbol_options = {f"{r['base_symbol']} — {r['name']}": r["symbol"] for r in results}
