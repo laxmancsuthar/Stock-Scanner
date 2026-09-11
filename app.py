@@ -423,6 +423,56 @@ def load_bundled_full_list() -> Optional[List[str]]:
     return load_bundled_list("Full NSE Cash Segment (slow, 1500+ stocks)")
 
 
+# ----------------------------------------------------------------------------
+# Detail-view helpers — index membership + market cap formatting.
+# Display-only additions for the stock detail view; scanning/scoring logic
+# above is untouched.
+# ----------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def get_indices_for_symbol(symbol_ns: str) -> List[str]:
+    """Which Nifty indices a stock currently belongs to (Nifty 50/100/200/500).
+
+    Uses the same fallback order as the rest of the app for index membership
+    (live NSE fetch -> bundled CSV -> small built-in hardcoded list), so this
+    stays consistent with whatever universe was actually used to find the
+    stock. Nifty 100 has no live/bundled source elsewhere in the app, so it
+    only checks the hardcoded list."""
+    base = symbol_ns.replace(".NS", "").strip().upper()
+    sym_ns = f"{base}.NS"
+
+    def _in_universe(label: str, hardcoded: List[str]) -> bool:
+        live = get_universe_live(label)
+        if live:
+            return sym_ns in live
+        bundled = load_bundled_list(label)
+        if bundled:
+            return sym_ns in bundled
+        return sym_ns in hardcoded
+
+    memberships = []
+    if _in_universe("Nifty 50", NIFTY_50_NS):
+        memberships.append("Nifty 50")
+    if sym_ns in NIFTY_100_NS:
+        memberships.append("Nifty 100")
+    if _in_universe("Nifty 200", NIFTY_200_NS):
+        memberships.append("Nifty 200")
+    if _in_universe("Nifty 500", NIFTY_500_NS):
+        memberships.append("Nifty 500")
+    return memberships
+
+
+def format_market_cap(market_cap: Optional[float]) -> str:
+    """Human-friendly ₹ Cr / Lakh Cr formatting for a raw market-cap number
+    (as returned by yfinance's `marketCap`, in plain rupees)."""
+    if not market_cap:
+        return "—"
+    cr = market_cap / 1e7
+    if cr >= 1_00_000:
+        return f"₹{cr / 1_00_000:.2f} Lakh Cr"
+    if cr >= 1000:
+        return f"₹{cr:,.0f} Cr"
+    return f"₹{cr:,.1f} Cr"
 
 
 # ============================================================================
@@ -2175,6 +2225,23 @@ def _analyze_one(symbol: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def passes_ema_stack(t: Dict[str, Any]) -> bool:
+    """EMA Trend Stack check: CMP > EMA9 > EMA20 > EMA50 > EMA200.
+
+    (Traders commonly refer to the 20-EMA here as the "21 EMA" — this app's
+    engine computes EMA20, so that's what's used for this check.)
+    Returns False if any of the required EMAs aren't available yet
+    (e.g. too little price history for EMA200).
+    """
+    if not t:
+        return False
+    price = t.get("price")
+    e9, e20, e50, e200 = t.get("ema9"), t.get("ema20"), t.get("ema50"), t.get("ema200")
+    if price is None or e9 is None or e20 is None or e50 is None or e200 is None:
+        return False
+    return price > e9 > e20 > e50 > e200
+
+
 def _passes_filters(c: Dict[str, Any], f: Dict[str, Any]) -> bool:
     if not f:
         return True
@@ -2199,6 +2266,8 @@ def _passes_filters(c: Dict[str, Any], f: Dict[str, Any]) -> bool:
                 return False
     setups = f.get("setup_types") or []
     if setups and not (set(c.get("setups", [c["setup_type"]])) & set(setups)):
+        return False
+    if f.get("require_ema_stack") and not passes_ema_stack(c.get("technical")):
         return False
     return True
 
@@ -3070,9 +3139,22 @@ def build_stock_report(candidate: dict, smart: Optional[Dict[str, Any]] = None) 
     sub.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(PDF_CARD)),
         ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
     ]))
     story.append(sub)
+
+    pdf_market_cap = candidate.get("market_cap")
+    pdf_indices = get_indices_for_symbol(candidate.get("symbol", ""))
+    meta_line = Table([[Paragraph(
+        f"Market Cap: <b>{format_market_cap(pdf_market_cap)}</b> "
+        f"&middot; Indices: <b>{', '.join(pdf_indices) if pdf_indices else '—'}</b>", small,
+    )]], colWidths=[content_w])
+    meta_line.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(PDF_CARD)),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+    ]))
+    story.append(meta_line)
 
     price = candidate.get("price", 0)
     change = candidate.get("change_pct", 0) or 0
@@ -3085,12 +3167,13 @@ def build_stock_report(candidate: dict, smart: Optional[Dict[str, Any]] = None) 
     story.append(_metric_row(
         [
             ("Price", _fmt(price, "₹")),
+            ("Market Cap", format_market_cap(pdf_market_cap)),
             ("Technical Score", f"{t_score}/100"),
             ("Fundamental Score", f"{f_score}/100"),
             ("RSI (14)", _fmt(t.get("rsi"), decimals=1)),
             ("ADX (14)", _fmt(t.get("adx"), decimals=1)),
         ],
-        content_w / 5, value_colors={0: change_color},
+        content_w / 6, value_colors={0: change_color},
     ))
     change_line = Table([[Paragraph(
         f"<font color='{change_color}'>{change_sign}{_fmt(change, '', '%')}</font>", small,
@@ -3603,6 +3686,397 @@ def render_news_article_card(item: dict):
 
 
 # ============================================================================
+# SECTION 4B: AI DEEP DIVE — combines everything this app already fetches
+# (technical/fundamental score, Screener.in financials + shareholding, news
+# sentiment) into one prompt, sends it to Gemini (Google's free-tier API),
+# and shows a structured research summary. No new scraping is added here —
+# it reuses the same cached functions the rest of the app already calls,
+# so it costs nothing extra in scraping load, only one Gemini API call per
+# stock (cached).
+# ============================================================================
+
+import os
+
+# ---------------------------------------------------------------------------
+# OPTION A (recommended): put your key in .streamlit/secrets.toml as
+#   GEMINI_API_KEY = "..."
+# OPTION B (quick/simple): paste your key directly below between the quotes.
+# If you paste it below, it's used regardless of secrets.toml/env — this is
+# fine for local testing, but do NOT share this file or upload it anywhere
+# (GitHub, forums, back to Claude, etc.) once your real key is in it, since
+# anyone with the file could use your key and run up your bill.
+# ---------------------------------------------------------------------------
+GEMINI_API_KEY_HARDCODED = "PASTE API KEY HERE"  # <-- paste your Gemini key here, e.g. "AQ.Ab8..."
+
+# Prefer Streamlit secrets (.streamlit/secrets.toml -> GEMINI_API_KEY = "...")
+# Falls back to an environment variable of the same name if secrets aren't set up.
+# Get a free key (no credit card) at https://aistudio.google.com/apikey
+# Needs: pip install google-genai
+try:
+    GEMINI_API_KEY = GEMINI_API_KEY_HARDCODED or st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
+except Exception:
+    GEMINI_API_KEY = GEMINI_API_KEY_HARDCODED or os.environ.get("GEMINI_API_KEY", "")
+
+GEMINI_MODEL = "gemini-3.6-flash"
+
+try:
+    from google import genai as _genai
+    from google.genai import types as _genai_types
+    _GENAI_SDK_AVAILABLE = True
+except ImportError:
+    _GENAI_SDK_AVAILABLE = False
+
+
+# ----------------------------------------------------------------------------
+# Concall auto-fetch: Screener.in already lists "Concalls" (Transcript / PPT /
+# REC links) on each company page — the same HTML this app already fetches
+# and caches for financials/shareholding. We reuse that cached HTML, pull out
+# the "Transcript" links (usually PDFs hosted on bseindia.com or the
+# company's own site), download the PDF, and extract its text with pypdf.
+# No new scraping target is added — same page, same session, same throttle.
+# ----------------------------------------------------------------------------
+
+def deepdive_extract_concall_links(html: str, max_items: int = 4) -> List[Dict[str, str]]:
+    """Finds 'Transcript' links anywhere on the Screener page and pairs each
+    with its nearby quarter label (e.g. 'Sep 2025'). Screener lists newest
+    first, so the returned order is assumed newest-to-oldest."""
+    soup = BeautifulSoup(html, "lxml")
+    links: List[Dict[str, str]] = []
+    seen_urls = set()
+    for a in soup.find_all("a", href=True):
+        text = (a.get_text() or "").strip().lower()
+        if text != "transcript":
+            continue
+        href = a["href"]
+        if href in seen_urls:
+            continue
+        seen_urls.add(href)
+        if href.startswith("/"):
+            href = "https://www.screener.in" + href
+        # Walk up to a reasonably-sized container and pull its text, minus
+        # the sibling link labels (Transcript/PPT/REC/Notes), to get the
+        # quarter/date label Screener prints next to each row.
+        label = ""
+        parent = a.find_parent(["li", "div"])
+        hops = 0
+        while parent is not None and hops < 3:
+            raw = parent.get_text(" ", strip=True)
+            for kw in ("Transcript", "PPT", "REC", "Notes", "Audio"):
+                raw = raw.replace(kw, "")
+            raw = re.sub(r"\s+", " ", raw).strip(" |,-")
+            if raw and len(raw) < 60:
+                label = raw
+                break
+            parent = parent.find_parent(["li", "div"])
+            hops += 1
+        links.append({"label": label or f"Concall {len(links) + 1}", "url": href})
+        if len(links) >= max_items:
+            break
+    return links
+
+
+def deepdive_fetch_pdf_text(url: str, max_chars: int = 6000) -> str:
+    """Downloads a PDF and extracts its text with pypdf, trimmed to
+    max_chars so it doesn't blow up the prompt. Returns an explanatory
+    string (not an exception) on any failure."""
+    try:
+        import pypdf
+    except ImportError:
+        return "[pypdf installed nahi hai — terminal mein 'pip install pypdf' chalao]"
+    try:
+        session = _screener_session()
+        resp = session.get(url, timeout=(8, 25))
+        resp.raise_for_status()
+        reader = pypdf.PdfReader(io.BytesIO(resp.content))
+        text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        text = text.strip()
+        if not text:
+            return "[PDF se text extract nahi ho paya — shayad scanned/image-based PDF hai]"
+        return text[:max_chars]
+    except Exception as e:
+        return f"[Concall PDF fetch/parse fail hui: {e}]"
+
+
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def deepdive_auto_fetch_concalls(symbol: str) -> Tuple[str, str, str]:
+    """Returns (prev_concall_text, latest_concall_text, status_message).
+    Cached for 24h per symbol since concalls only change quarterly."""
+    html = _get_screener_html_cached(symbol)
+    if not html:
+        return ("", "", "⚠️ Screener page hi fetch nahi ho payi — baad mein retry karo.")
+    links = deepdive_extract_concall_links(html, max_items=3)
+    if not links:
+        return ("", "", "⚠️ Is stock ke liye Screener.in par koi concall transcript link nahi mila.")
+    latest_text = deepdive_fetch_pdf_text(links[0]["url"])
+    latest_text = f"[{links[0]['label']}]\n{latest_text}"
+    prev_text = ""
+    if len(links) >= 2:
+        prev_text = deepdive_fetch_pdf_text(links[1]["url"])
+        prev_text = f"[{links[1]['label']}]\n{prev_text}"
+    status = f"✅ {len(links)} concall(s) mile, latest {len(links)} mein se 2 use kiye."
+    return (prev_text, latest_text, status)
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def deepdive_fetch_corp_announcements(symbol: str, days: int = 180, max_items: int = 8) -> List[Dict[str, str]]:
+    """Pulls recent official corporate announcements (results PR, board
+    meeting outcomes, etc.) straight from NSE's public announcements API —
+    same cookie-warm-up pattern this app already uses for index lists.
+    Returns [] (not an exception) on any failure so the deep dive can carry
+    on without this section."""
+    base = symbol.replace(".NS", "").strip().upper()
+    session = requests.Session()
+    session.headers.update(NSE_HEADERS)
+    try:
+        session.get("https://www.nseindia.com", timeout=8)  # warms up cookies, NSE requires this
+        resp = session.get(
+            "https://www.nseindia.com/api/corporate-announcements",
+            params={"index": "equities", "symbol": base},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        cutoff = datetime.now() - timedelta(days=days)
+        items = []
+        for row in data if isinstance(data, list) else []:
+            desc = row.get("desc") or row.get("subject") or row.get("attchmntText") or ""
+            dt_str = row.get("an_dt") or row.get("sm_dt") or row.get("date") or ""
+            try:
+                dt = pd.to_datetime(dt_str, errors="coerce")
+            except Exception:
+                dt = None
+            if dt is not None and pd.notna(dt) and dt.to_pydatetime().replace(tzinfo=None) < cutoff:
+                continue
+            if desc:
+                items.append({"date": str(dt_str), "text": desc.strip()})
+            if len(items) >= max_items:
+                break
+        return items
+    except Exception:
+        return []
+
+
+def deepdive_fetch_recent_deals(symbol: str, days: int = 30) -> List[Dict[str, str]]:
+    """Reuses the app's existing news categorization (category='deals' already
+    covers order wins, contract awards, mergers, acquisitions, partnerships)
+    but looks back further (30 days vs the 7-day general sentiment window)
+    since order-win news can be a few weeks old and still very relevant."""
+    if not NEWSAPI_KEY:
+        return []
+    analysis = news_get_analysis(symbol, api_key=NEWSAPI_KEY, days=days)
+    all_items = analysis.get('good_news', []) + analysis.get('bad_news', []) + analysis.get('neutral_news', [])
+    deal_items = [a for a in all_items if a.get('category') == 'deals']
+    return [{"title": a["title"], "source": a["source"]} for a in deal_items[:8]]
+
+
+def deepdive_build_context(symbol: str, c: Dict[str, Any], smart: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Pulls together everything this app already knows about the stock —
+    no fresh scraping, just reusing already-cached results — into one plain
+    dict that gets serialized into the AI prompt."""
+    fin_data = fetch_quarterly_yearly_financials(c["symbol"]) or {}
+    sh_filings = fetch_shareholding_filings(c["symbol"]) or []
+    news = news_get_analysis(
+        c["base_symbol"], api_key=NEWSAPI_KEY, days=7
+    ) if NEWSAPI_KEY else {}
+    corp_announcements = deepdive_fetch_corp_announcements(c["base_symbol"])
+    recent_deals = deepdive_fetch_recent_deals(c["base_symbol"])
+
+    return {
+        "company_name": c.get("name", c["base_symbol"]),
+        "ticker": c["base_symbol"],
+        "sector": c.get("sector", "—"),
+        "industry": c.get("industry", "—"),
+        "cmp": c.get("price"),
+        "technical_score": c.get("technical_score"),
+        "fundamental_score": c.get("fundamental_score"),
+        "scanner_reasons": c.get("reasons", []),
+        "scanner_red_flags": c.get("red_flags", []),
+        "smart_scanner": {
+            "final_score": (smart or {}).get("finalScore"),
+            "momentum": (smart or {}).get("oscScore"),
+            "trend": (smart or {}).get("trendScore"),
+            "strength": (smart or {}).get("strengthScore"),
+            "red_flags": sm_compute_red_flags((smart or {}).get("fund_data") or {}),
+        } if smart else None,
+        "quarterly_annual_financials_qoq_yoy": fin_data,
+        "shareholding_pattern": sh_filings[0] if sh_filings else {},
+        "recent_news_summary": {
+            "sentiment": news.get("overall_sentiment"),
+            "confidence": news.get("overall_confidence"),
+            "good_news_headlines": [a["title"] for a in news.get("good_news", [])[:5]],
+            "bad_news_headlines": [a["title"] for a in news.get("bad_news", [])[:5]],
+        } if news else None,
+        "corporate_announcements": corp_announcements,
+        "recent_order_wins_or_deals": recent_deals,
+    }
+
+
+def deepdive_build_prompt(ctx: Dict[str, Any], concall_prev: str = "", concall_latest: str = "") -> str:
+    """Fills the deep-dive template with the gathered context. `concall_prev`
+    and `concall_latest` are optional free text the user can paste in (this
+    app doesn't scrape concall transcripts automatically — BSE/NSE
+    announcement PDFs and company IR pages aren't wired up yet). Giving both
+    lets the model compare guidance-vs-delivery across the two calls."""
+    concall_prev_block = concall_prev.strip() if concall_prev.strip() else "Not provided by user."
+    concall_latest_block = concall_latest.strip() if concall_latest.strip() else "Not provided by user."
+
+    return f"""Tum ek equity research analyst ho jo Indian stock market ke liye detailed, balanced aur risk-aware analysis karta hai. Tum kabhi buy/sell recommendation nahi dete — sirf factual analysis aur risk highlight karte ho taaki investor khud informed decision le sake.
+
+Stock: {ctx['company_name']} ({ctx['ticker']})
+Sector: {ctx['sector']} / {ctx['industry']}
+CMP: ₹{ctx['cmp']}
+
+=== SCANNER SCORES (from this app's own technical/fundamental engine) ===
+Technical Score: {ctx['technical_score']}/100
+Fundamental Score: {ctx['fundamental_score']}/100
+Scanner Reasons (positive): {ctx['scanner_reasons']}
+Scanner Red Flags: {ctx['scanner_red_flags']}
+Smart Scanner (momentum/trend/strength): {ctx['smart_scanner']}
+
+=== QUARTERLY/ANNUAL FINANCIALS (QoQ & YoY %, from Screener.in) ===
+{ctx['quarterly_annual_financials_qoq_yoy']}
+
+=== SHAREHOLDING PATTERN (QoQ, from Screener.in) ===
+{ctx['shareholding_pattern']}
+
+=== RECENT NEWS SENTIMENT (last 7 days) ===
+{ctx['recent_news_summary']}
+
+=== RECENT CORPORATE ANNOUNCEMENTS (last 6 months, official NSE filings — results PR, board meeting outcomes, etc.) ===
+{ctx['corporate_announcements']}
+
+=== RECENT ORDER WINS / BIG DEALS (last 30 days news — contract awards, mergers, acquisitions, partnerships) ===
+{ctx['recent_order_wins_or_deals']}
+
+=== PREVIOUS QUARTER CONCALL (promises/guidance given at that time, user-provided) ===
+{concall_prev_block}
+
+=== LATEST QUARTER CONCALL (current commentary + any update on old promises, user-provided) ===
+{concall_latest_block}
+
+=== TASK ===
+Upar diye gaye data ke aadhar par ek structured "Deep Dive" report banao:
+
+1. **Business Snapshot** (2-3 lines)
+2. **Recent Corporate Developments** — koi bhi naya order win, bada contract, merger/acquisition, partnership, ya important board decision jo corporate announcements ya deals news mein mila ho, bullet list mein highlight karo. Agar kuch nahi mila to "No major recent order wins or deals found in available data."
+3. **Financial Health** (Strong / Moderate / Weak) — revenue/profit trend, margin trend, debt signal — 2 line justification
+4. **Shareholding & Sentiment Read** — promoter/FII/DII trend ka matlab, news sentiment ka context
+5. **Promise vs Delivery Tracker** — ye sabse important section hai:
+   - Pichhle concall mein management ne jo specific promises/guidance diye the (revenue growth %, margin target, capex plan, new launches, debt reduction, etc.) unko bullet list mein nikalo
+   - Har promise ke saamne likho: **Delivered / Partially Delivered / Not Delivered / Not enough data to verify** — aur uska justification financial data ya latest concall se do
+   - Agar dono concall text provided nahi hain, to likho "Promise-tracking ke liye dono quarters ka concall text chahiye — abhi available nahi hai."
+6. **New Guidance for Future** — latest concall mein management ne aage ke liye kya naya guidance/promise diya hai (bullet points), aur management ka tone (confident/cautious/vague)
+7. **Red Flags** — scanner ke red flags ko explain karo plain language mein, plus koi aur pattern jo data mein dikh raha ho (including agar management baar baar promises miss kar raha hai to ye bhi ek red flag hai). Agar kuch nahi mila to "No major red flags identified in available data."
+8. **Key Risks to Watch** (3-4 bullets)
+9. **Data Gaps** — kya missing tha jisse analysis incomplete raha
+
+RULES: Kabhi "buy/sell/target price/guaranteed return" jaisi language use mat karo. Sirf diya gaya data use karo, bahar se numbers mat lao. Hinglish mein likho, concise rakho."""
+
+
+def deepdive_call_claude(prompt: str) -> str:
+    """One Gemini API call via Google's official SDK (handles both legacy
+    'AIza...' and newer 'AQ....' key formats automatically — a raw REST
+    call with '?key=' can reject the newer format depending on account
+    settings, the SDK does not have that problem). Returns a friendly error
+    string instead of raising, since this runs inside a Streamlit button
+    handler, not a script that can crash."""
+    if not GEMINI_API_KEY:
+        return ("⚠️ GEMINI_API_KEY set nahi hai. `.streamlit/secrets.toml` mein "
+                "`GEMINI_API_KEY = \"...\"` add karo (free key: https://aistudio.google.com/apikey), "
+                "ya environment variable set karo.")
+    if not _GENAI_SDK_AVAILABLE:
+        return ("⚠️ `google-genai` package installed nahi hai. Terminal mein chalao: "
+                "`pip install google-genai` , phir app restart karo.")
+    try:
+        client = _genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=_genai_types.GenerateContentConfig(
+                max_output_tokens=4000,
+                thinking_config=_genai_types.ThinkingConfig(thinking_level="low"),
+            ),
+        )
+        return response.text or "⚠️ Gemini se khali response mila."
+    except Exception as e:
+        return f"⚠️ Gemini API call fail hui: {e}"
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def deepdive_cached(symbol: str, ctx_json: str, concall_prev: str, concall_latest: str) -> str:
+    """Cached by (symbol, serialized context, both concall notes) — same
+    stock with unchanged data won't re-call the API for 6 hours. Passing
+    ctx_json (a string) rather than the dict lets Streamlit's cache hash it
+    properly."""
+    ctx = json.loads(ctx_json)
+    prompt = deepdive_build_prompt(ctx, concall_prev, concall_latest)
+    return deepdive_call_claude(prompt)
+
+
+def render_ai_deep_dive(symbol: str, c: Dict[str, Any], smart: Optional[Dict[str, Any]]):
+    """The UI block: a button + optional concall-paste box + rendered result.
+    Call this from inside render_stock_detail()."""
+    with st.expander("🤖 AI Deep Dive (Screener + Scanner + News combined)", expanded=False):
+        st.caption(
+            "Ye app ke apne data (technical/fundamental score, Screener.in financials, "
+            "shareholding, news sentiment, NSE corporate announcements) ko combine karke Gemini se ek structured research "
+            "summary banata hai. Ye investment advice nahi hai."
+        )
+        if st.button("📥 Auto-fetch concalls from Screener.in", key=f"dd_autofetch_{symbol}"):
+            with st.spinner("Screener.in se concall transcripts dhoond rahe hain..."):
+                prev_auto, latest_auto, status_msg = deepdive_auto_fetch_concalls(symbol)
+            st.session_state[f"concall_prev_{symbol}"] = prev_auto
+            st.session_state[f"concall_latest_{symbol}"] = latest_auto
+            st.session_state[f"dd_autofetch_status_{symbol}"] = status_msg
+            st.rerun()
+
+        autofetch_status = st.session_state.get(f"dd_autofetch_status_{symbol}")
+        if autofetch_status:
+            st.caption(autofetch_status)
+
+        cc_col1, cc_col2 = st.columns(2)
+        concall_prev = cc_col1.text_area(
+            "Previous quarter concall (promises/guidance given)",
+            key=f"concall_prev_{symbol}",
+            placeholder="Pichhle quarter ke concall se: management ne kya guidance diya tha (revenue growth, margin target, capex, new launches, etc.)... Ya upar 'Auto-fetch' dabao.",
+            height=140,
+        )
+        concall_latest = cc_col2.text_area(
+            "Latest quarter concall (delivery update + new guidance)",
+            key=f"concall_latest_{symbol}",
+            placeholder="Latest concall se: management ne purane promises ka kya status bataya, aur aage ke liye kya naya guidance diya... Ya upar 'Auto-fetch' dabao.",
+            height=140,
+        )
+        st.caption(
+            "Dono boxes optional hain, lekin dono diye jayenge to AI 'promise vs delivery' ka proper comparison kar payega. "
+            "Auto-fetch Screener.in ke 'Concalls' section se transcript PDF nikalta hai — agar wahan transcript nahi mila, "
+            "ya PDF scanned/image-based hai, to manually paste kar sakte ho (concall.in, company IR page, ya Trendlyne se)."
+        )
+
+        dd_col1, dd_col2 = st.columns([1, 1])
+        run_dd = dd_col1.button("🔍 Run Deep Dive", key=f"dd_run_{symbol}", use_container_width=True)
+        if dd_col2.button("🔄 Force refresh (ignore cache)", key=f"dd_refresh_{symbol}", use_container_width=True):
+            deepdive_cached.clear()
+            run_dd = True
+
+        if run_dd:
+            with st.spinner("Gathering data aur Gemini se analysis maang rahe hain..."):
+                ctx = deepdive_build_context(symbol, c, smart)
+                ctx_json = json.dumps(ctx, default=str, sort_keys=True)
+                result = deepdive_cached(symbol, ctx_json, concall_prev, concall_latest)
+            st.session_state[f"dd_result_{symbol}"] = result
+
+        result = st.session_state.get(f"dd_result_{symbol}")
+        if result:
+            st.markdown(result)
+            st.caption(
+                "⚠️ AI-generated research hai, available data par based. Investment advice nahi hai. "
+                "Apna independent research karein aur zaroorat pare to SEBI-registered advisor se consult karein."
+            )
+
+
+# ============================================================================
+# ============================================================================
 # SECTION 5: lightweight local persistence (drop-in replacement for MongoDB)
 # Watchlist / notes / alerts / past scans are saved to data.json next to this
 # file, so they survive an app restart. Loaded once into session_state.
@@ -3803,10 +4277,13 @@ def render_stock_detail(symbol: str, smart_result: Optional[Dict[str, Any]] = No
         with st.spinner("Computing Smart Scanner momentum/trend/strength score..."):
             smart = sm_compute_score_for_symbol(c["base_symbol"])
 
+    indices = get_indices_for_symbol(c["symbol"])
+
     top_l, top_r = st.columns([3, 1.4])
     with top_l:
         st.subheader(f"{c['name']} ({c['base_symbol']})")
         st.caption(f"{c.get('sector','—')} · {c.get('industry','—')}")
+        st.caption(f"📇 Indices: {', '.join(indices) if indices else '—'}")
     with top_r:
         badges = "".join(
             f"<span style='background:{SETUP_COLORS.get(s,'#64748B')};color:white;padding:3px 9px;"
@@ -3815,12 +4292,15 @@ def render_stock_detail(symbol: str, smart_result: Optional[Dict[str, Any]] = No
         )
         st.markdown(f"<div style='text-align:right'>{badges}</div>", unsafe_allow_html=True)
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Price", f"₹{c['price']:.2f}", f"{c['change_pct']:.2f}%")
-    m2.metric("Technical Score", f"{c['technical_score']}/100")
-    m3.metric("Fundamental Score", f"{c['fundamental_score']}/100")
-    m4.metric("RSI (14)", f"{t['rsi']:.1f}")
-    m5.metric("ADX (14)", f"{t['adx']:.1f}" if t.get("adx") is not None else "—")
+    m2.metric("Market Cap", format_market_cap(c.get("market_cap")))
+    m3.metric("Technical Score", f"{c['technical_score']}/100")
+    m4.metric("Fundamental Score", f"{c['fundamental_score']}/100")
+    m5.metric("RSI (14)", f"{t['rsi']:.1f}")
+    m6.metric("ADX (14)", f"{t['adx']:.1f}" if t.get("adx") is not None else "—")
+
+    st.caption(f"🏢 Sector: **{c.get('sector','—')}**  ·  Industry: {c.get('industry','—')}")
 
     b1, b2 = st.columns(2)
     with b1:
@@ -4036,6 +4516,8 @@ def render_stock_detail(symbol: str, smart_result: Optional[Dict[str, Any]] = No
             else:
                 st.caption("No delivery data returned (report may not be published yet for recent sessions, or symbol/series mismatch).")
 
+    render_ai_deep_dive(symbol, c, smart)
+
     st.markdown("#### 📝 Your Notes")
     note_val = st.text_area("Notes", value=get_note(symbol), key=f"note_{symbol}", label_visibility="collapsed")
     if st.button("Save note", key=f"savenote_{symbol}"):
@@ -4098,39 +4580,54 @@ if st.sidebar.button("View stock", use_container_width=True) and lookup.strip():
 
 # ============================== SCANNER PAGE ============================
 if page == "🔍 Scanner":
-    st.sidebar.markdown("### Scan Filters")
-    universe_label = st.sidebar.selectbox(
-        "Universe", ["Nifty 50", "Nifty 200", "Nifty 500", "Full NSE Cash Segment (slow, 1500+ stocks)"], index=2,
-    )
-    use_live_nse = st.sidebar.checkbox(
-        "Fetch live list from NSE", value=True,
-        help="Downloads the current constituent list directly from nseindia.com. "
-             "Falls back to the built-in list if NSE blocks the request.",
-    )
+    st.title("Scanner")
+    st.caption("Unified technical engine: EMA/RSI/MACD/VWAP/ATR + ADX/Stochastic/Bollinger + candlestick patterns, divergence, gap & multi-timeframe confluence.")
 
-    setups_sel = st.sidebar.multiselect(
-        "Setup types (optional)",
-        list(SETUP_LABELS.keys())[:-1],
-        format_func=lambda k: SETUP_LABELS.get(k, k),
-    )
-    min_tech = st.sidebar.slider("Min technical score", 0, 100, 70)
-    min_fund = st.sidebar.slider("Min fundamental score", 0, 100, 60)
+    with st.form("scanner_form"):
+        st.markdown("##### Universe")
+        u1, u2 = st.columns(2)
+        universe_label = u1.selectbox(
+            "Universe", ["Nifty 50", "Nifty 200", "Nifty 500", "Full NSE Cash Segment (slow, 1500+ stocks)"], index=2,
+        )
+        use_live_nse = u2.checkbox(
+            "Fetch live list from NSE", value=True,
+            help="Downloads the current constituent list directly from nseindia.com. "
+                 "Falls back to the built-in list if NSE blocks the request.",
+        )
 
-    st.sidebar.markdown("**Market Cap range (₹ Crore)**")
-    mc1, mc2 = st.sidebar.columns(2)
-    min_mcap_input = mc1.number_input("Min", min_value=0, value=0, step=100, key="min_mcap_input", label_visibility="collapsed", placeholder="Min")
-    max_mcap_input = mc2.number_input("Max (0 = no limit)", min_value=0, value=0, step=100, key="max_mcap_input", label_visibility="collapsed", placeholder="Max (0 = no limit)")
-    st.sidebar.caption("e.g. Small cap < 5,000 Cr · Mid cap 5,000–20,000 Cr · Large cap > 20,000 Cr")
+        st.markdown("##### Filters")
+        setups_sel = st.multiselect(
+            "Setup types (optional)",
+            list(SETUP_LABELS.keys())[:-1],
+            format_func=lambda k: SETUP_LABELS.get(k, k),
+        )
 
-    top_n = st.sidebar.slider(
-        "Show top N stocks", 1, 15, 5,
-        help="Only the top N matches (by combined technical + fundamental score) will be shown. CSV export always includes every scanned match.",
-    )
+        s1, s2 = st.columns(2)
+        min_tech = s1.slider("Min technical score", 0, 100, 70)
+        min_fund = s2.slider("Min fundamental score", 0, 100, 60)
 
-    run_col, clear_col = st.sidebar.columns(2)
-    run_clicked = run_col.button("🚀 Run Scan", type="primary", use_container_width=True)
-    clear_clicked = clear_col.button(
-        "🗑️ Clear", use_container_width=True,
+        require_ema_stack = st.checkbox(
+            "📈 EMA Trend Stack (CMP > 9 EMA > 21 EMA > 50 EMA > 200 EMA)",
+            value=True,
+            help="Sirf wahi stocks pass honge jinme Price > EMA9 > EMA20 > EMA50 > EMA200 "
+                 "(strict bullish trend alignment). Yaha '21 EMA' ke liye engine ka EMA20 use hota hai.",
+        )
+
+        st.markdown("**Market Cap range (₹ Crore)**")
+        mc1, mc2 = st.columns(2)
+        min_mcap_input = mc1.number_input("Min", min_value=0, value=0, step=100, key="min_mcap_input", label_visibility="collapsed", placeholder="Min")
+        max_mcap_input = mc2.number_input("Max (0 = no limit)", min_value=0, value=0, step=100, key="max_mcap_input", label_visibility="collapsed", placeholder="Max (0 = no limit)")
+        st.caption("e.g. Small cap < 5,000 Cr · Mid cap 5,000–20,000 Cr · Large cap > 20,000 Cr")
+
+        top_n = st.slider(
+            "Show top N stocks", 1, 15, 5,
+            help="Only the top N matches (by combined technical + fundamental score) will be shown. CSV export always includes every scanned match.",
+        )
+
+        run_clicked = st.form_submit_button("🚀 Run Scan", type="primary", use_container_width=True)
+
+    clear_clicked = st.button(
+        "🗑️ Clear results", use_container_width=True,
         disabled=not st.session_state.scan_results,
     )
 
@@ -4138,9 +4635,6 @@ if page == "🔍 Scanner":
         st.session_state.scan_results = []
         st.session_state.selected_symbol = None
         st.rerun()
-
-    st.title("Scanner")
-    st.caption("Unified technical engine: EMA/RSI/MACD/VWAP/ATR + ADX/Stochastic/Bollinger + candlestick patterns, divergence, gap & multi-timeframe confluence.")
 
     if run_clicked:
         fallback_key = {
@@ -4175,6 +4669,7 @@ if page == "🔍 Scanner":
             "setup_types": setups_sel,
             "min_mcap_cr": min_mcap_input if min_mcap_input > 0 else None,
             "max_mcap_cr": max_mcap_input if max_mcap_input > 0 else None,
+            "require_ema_stack": require_ema_stack,
         }
 
         progress_bar = st.progress(0.0)
@@ -4213,6 +4708,7 @@ if page == "🔍 Scanner":
             "Price (₹)": round(r["price"], 2), "Change %": round(r["change_pct"], 2),
             "Market Cap (₹ Cr)": round(r["market_cap"] / 1e7, 0) if r.get("market_cap") else None,
             "Tech Score": r["technical_score"], "Fund Score": r["fundamental_score"],
+            "EMA Stack": "✅" if passes_ema_stack(r.get("technical")) else "❌",
             "Setups": ", ".join(SETUP_LABELS.get(s, s) for s in (r.get("setups") or [r["setup_type"]])),
         } for r in results])
         st.dataframe(df, use_container_width=True, hide_index=True)
@@ -4223,6 +4719,7 @@ if page == "🔍 Scanner":
             "Price (₹)": round(r["price"], 2), "Change %": round(r["change_pct"], 2),
             "Market Cap (₹ Cr)": round(r["market_cap"] / 1e7, 0) if r.get("market_cap") else None,
             "Tech Score": r["technical_score"], "Fund Score": r["fundamental_score"],
+            "EMA Stack": "✅" if passes_ema_stack(r.get("technical")) else "❌",
             "Setups": ", ".join(SETUP_LABELS.get(s, s) for s in (r.get("setups") or [r["setup_type"]])),
         } for r in all_results])
         csv_bytes = df_all.to_csv(index=False).encode("utf-8")
@@ -4236,7 +4733,7 @@ if page == "🔍 Scanner":
         if st.button("Open detail view"):
             st.session_state.selected_symbol = symbol_options[pick]
     else:
-        st.info("Set your filters in the sidebar and click **Run Scan** to find swing-trade candidates.")
+        st.info("Filters set karke **Run Scan** click karo swing-trade candidates dhoondne ke liye.")
 
     if st.session_state.selected_symbol:
         st.markdown("---")
@@ -4642,6 +5139,14 @@ elif page == "🎯 Smart Scanner":
             "Run Fundamental Check (Screener.in)", value=True,
             help="Off karne se sirf momentum + breakout filter chalega (fast, koi Screener.in call nahi)",
         )
+        sm_require_ema_stack = st.checkbox(
+            "📈 EMA Trend Stack (CMP > 9 EMA > 21 EMA > 50 EMA > 200 EMA)",
+            value=True,
+            help="Sirf wahi stocks pass honge jinme Price > EMA9 > EMA20 > EMA50 > EMA200 "
+                 "(strict bullish trend alignment). Yaha '21 EMA' ke liye engine ka EMA20 use hota hai. "
+                 "ON karne par is scanner ka price history fetch 6-month se 1-year kiya jaata hai "
+                 "(EMA200 ko sahi calculate karne ke liye), isliye scan thoda slow ho sakta hai.",
+        )
 
         u1, u2 = st.columns(2)
         sm_universe_options = [
@@ -4685,9 +5190,19 @@ elif page == "🎯 Smart Scanner":
         for i, sym in enumerate(stocks_to_scan, 1):
             prog1.progress(i / total, text=f"Scanning {sym} ({i}/{total})")
             try:
-                df = _yf_history_with_retry(sym + ".NS", period="6mo", auto_adjust=True)
+                fetch_period = "1y" if sm_require_ema_stack else "6mo"
+                df = _yf_history_with_retry(sym + ".NS", period=fetch_period, auto_adjust=True)
                 if df is None or len(df) < 50:
                     continue
+                if sm_require_ema_stack:
+                    close = df['Close'].astype(float)
+                    e9, e20, e50, e200 = ema(close, 9), ema(close, 20), ema(close, 50), ema(close, 200)
+                    if len(df) < 200:
+                        continue  # not enough history for a reliable EMA200
+                    cmp_ = float(close.iloc[-1])
+                    stack_ok = cmp_ > e9.iloc[-1] > e20.iloc[-1] > e50.iloc[-1] > e200.iloc[-1]
+                    if not stack_ok:
+                        continue
                 score = sm_compute_momentum_score(df)
                 breakout = sm_detect_breakout(df, near_pct=breakout_near_pct)
                 score_in_range = bool(score and score_min <= score['finalScore'] <= score_max)
@@ -4840,6 +5355,12 @@ elif page == "🧬 Multi Scanner":
         ms1, ms2 = st.columns(2)
         multi_min_tech = ms1.slider("Min technical score", 0, 100, 70, key="multi_min_tech")
         multi_min_fund = ms2.slider("Min fundamental score", 0, 100, 65, key="multi_min_fund")
+        multi_require_ema_stack = st.checkbox(
+            "📈 EMA Trend Stack (CMP > 9 EMA > 21 EMA > 50 EMA > 200 EMA)",
+            value=True, key="multi_require_ema_stack",
+            help="Sirf wahi stocks pass honge jinme Price > EMA9 > EMA20 > EMA50 > EMA200 "
+                 "(strict bullish trend alignment). Yaha '21 EMA' ke liye engine ka EMA20 use hota hai.",
+        )
 
         st.markdown("##### Smart Scanner engine filters (Momentum + Breakout)")
         mm1, mm2 = st.columns(2)
@@ -4886,7 +5407,10 @@ elif page == "🧬 Multi Scanner":
             tickers = get_universe(fallback_key)
             st.caption(f"⚠️ Falling back to the small built-in list ({len(tickers)} symbols).")
 
-        filters = {"min_technical_score": multi_min_tech, "min_fundamental_score": multi_min_fund}
+        filters = {
+            "min_technical_score": multi_min_tech, "min_fundamental_score": multi_min_fund,
+            "require_ema_stack": multi_require_ema_stack,
+        }
         sm_filters = {
             "score_range": (multi_score_min, multi_score_max),
             "breakout_near_pct": multi_breakout_near_pct,
@@ -4944,6 +5468,7 @@ elif page == "🧬 Multi Scanner":
                 "Symbol": r["base_symbol"], "Name": r["name"], "Sector": r["sector"],
                 "Price (₹)": round(r["price"], 2), "Change %": round(r["change_pct"], 2),
                 "Tech Score": r["technical_score"], "Fund Score": r["fundamental_score"],
+                "EMA Stack": "✅" if passes_ema_stack(r.get("technical")) else "❌",
                 "Momentum": r["smart"]["finalScore"], "Trend": r["smart"]["trendScore"],
                 "Strength": r["smart"]["strengthScore"],
                 "Setups": ", ".join(SETUP_LABELS.get(s, s) for s in (r.get("setups") or [r["setup_type"]])),
