@@ -9,3 +9,4 @@ matplotlib
 reportlab
 nse
 httpx[http2]
+bseindia
