@@ -4822,12 +4822,7 @@ elif page == "📢 Bulk/Block Deals":
             display_df = all_deals_df.copy()
             if search_symbol.strip():
                 q = search_symbol.strip().upper()
-                sym_match = display_df["Symbol"].astype(str).str.upper().str.contains(q, na=False)
-                if "Security" in display_df.columns:
-                    sec_match = display_df["Security"].astype(str).str.upper().str.contains(q, na=False)
-                    display_df = display_df[sym_match | sec_match]
-                else:
-                    display_df = display_df[sym_match]
+                display_df = display_df[display_df["Symbol"].astype(str).str.upper().str.contains(q, na=False)]
 
             if all_deals_mode == "delivery" and min_qty:
                 display_df = display_df[display_df["Traded Qty"].fillna(0) >= min_qty]
