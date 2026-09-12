@@ -12,6 +12,8 @@ HOW TO RUN
 ----------
 1) Install dependencies:
    pip install streamlit yfinance pandas numpy reportlab plotly
+   pip install nse            # for NSE bulk/block deals (date-range)
+   pip install bseindia       # for BSE bulk/block deals (latest trading day only)
 
 2) Run:
    streamlit run swing_trade_screener_streamlit.py
@@ -2720,6 +2722,91 @@ def fetch_all_deals(deal_type: str = "bulk", days: int = 90) -> pd.DataFrame:
     return pd.DataFrame([_normalize_deal_row(r) for r in rows])
 
 
+# ============================================================================
+# SECTION 3C: BSE bulk/block deals — via the `bseindia` PyPI package.
+# ----------------------------------------------------------------------------
+# IMPORTANT LIMITATION: unlike NSE (which lets us query any date range via
+# client.bulkdeals(fromdate, todate)), BSE does not expose a public,
+# documented date-range endpoint for bulk/block deals. The `bseindia`
+# package — and bseindia.com's own public page — only expose the LATEST
+# trading day's bulk/block deals ("as on today"). So the BSE rows added
+# here always reflect just the most recent trading day, regardless of the
+# 'Period' dropdown above (which still fully applies to the NSE rows).
+#
+# Practical effect: if you fetch deals today, you'll see today's BSE bulk/
+# block deals merged in. A BSE deal from several days ago (like the
+# 04-09-2026 FILATEX example) will only show up if you fetch on the same
+# day it happened — for older BSE deals you'll still need bseindia.com
+# directly. If BSE later publishes/exposes a proper historical endpoint,
+# this can be swapped in without changing anything else on the page.
+#
+# Install:  pip install bseindia
+# ============================================================================
+
+try:
+    from bseindia import equity as _bse_equity
+    _BSE_LIB_AVAILABLE = True
+except ImportError:
+    _BSE_LIB_AVAILABLE = False
+
+
+def _normalize_bse_deal_row(r: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a single BSE bulk/block deal record (field names in the
+    `bseindia` package's response can vary slightly by report) into the same
+    shape used for NSE rows, so both can be concatenated into one table."""
+    def pick(*keys):
+        for k in keys:
+            if k in r and r[k] not in (None, ""):
+                return r[k]
+        return None
+
+    scrip_code = pick("scrip_code", "SCRIP_CODE", "ScripCode", "security_code", "SecurityCode")
+    name = pick("scrip_name", "SCRIP_NAME", "ScripName", "security_name", "SecurityName", "CompanyName", "company_name")
+    client = pick("client_name", "ClientName", "CLIENT_NAME", "Client_Name")
+    buy_sell = pick("buy_sell", "BuySell", "Deal_type", "DealType", "Order_Type", "OrderType")
+    qty = pick("quantity_traded", "Quantity", "QtyTraded", "TRADED_QTY", "quantity")
+    price = pick("trade_price_wt_avg", "Price", "TradedPrice", "TRADED_PRICE", "price", "rate")
+    date = pick("deal_date", "DEAL_DATE", "TradeDate", "Date", "date")
+
+    sym_display = str(name or scrip_code or "").strip()
+    return {
+        "Date": date,
+        "Symbol": sym_display,
+        "Security": str(name or "").strip(),
+        "Client": str(client or "").strip() if client else client,
+        "Buy/Sell": buy_sell,
+        "Qty": qty,
+        "Price": price,
+    }
+
+
+def fetch_bse_deals_today(deal_type: str = "bulk") -> List[Dict[str, Any]]:
+    """BSE bulk or block deals for the most recent trading day only
+    (see the module-level note above on why this can't take a date range)."""
+    if not _BSE_LIB_AVAILABLE:
+        return []
+    try:
+        df = _bse_equity.bulk_deal_as_on_today() if deal_type == "bulk" else _bse_equity.block_deal_as_on_today()
+    except Exception:
+        return []
+    if df is None:
+        return []
+    try:
+        if hasattr(df, "empty") and df.empty:
+            return []
+        return df.to_dict("records")
+    except Exception:
+        return []
+
+
+def fetch_all_bse_deals(deal_type: str = "bulk") -> pd.DataFrame:
+    """BSE equivalent of fetch_all_deals() — latest trading day only."""
+    rows = fetch_bse_deals_today(deal_type)
+    if not rows:
+        return pd.DataFrame(columns=["Date", "Symbol", "Security", "Client", "Buy/Sell", "Qty", "Price"])
+    return pd.DataFrame([_normalize_bse_deal_row(r) for r in rows])
+
+
 # ----------------------------------------------------------------------------
 # Delivery % — NSE's daily full-market "bhavcopy with delivery" CSV
 # ----------------------------------------------------------------------------
@@ -4764,10 +4851,13 @@ elif page == "⭐ Watchlist":
 elif page == "📢 Bulk/Block Deals":
     st.title("Bulk & Block Deals / Delivery % — Last N Days")
     st.caption(
-        "All bulk/block deals reported on NSE across every stock (not just your "
-        "scan universe), via the `nse` package. Large trades here can hint at "
-        "institutional accumulation or exit — cross-check before acting. Switch "
-        "'Deal type' to Best Delivery % for a market-wide delivery leaderboard."
+        "Bulk/block deals across every stock (not just your scan universe) — "
+        "NSE deals via the `nse` package cover the full selected period, while "
+        "BSE deals (via `bseindia`) only cover the latest trading day, since BSE "
+        "doesn't publish a public historical date-range API for deals. Large "
+        "trades here can hint at institutional accumulation or exit — "
+        "cross-check before acting. Switch 'Deal type' to Best Delivery % for a "
+        "market-wide delivery leaderboard."
     )
 
     if not _NSE_LIB_AVAILABLE:
@@ -4791,26 +4881,43 @@ elif page == "📢 Bulk/Block Deals":
                 min_value=0.0, max_value=100.0, value=55.0, step=5.0, key="deals_min_delivery_pct",
             )
 
+        if not _BSE_LIB_AVAILABLE:
+            st.caption("ℹ️ `bseindia` package not installed — showing NSE deals only. Run `pip install bseindia` to also include BSE bulk/block deals.")
+
         if st.button("🔄 Fetch deals", type="primary", key="fetch_all_deals_btn"):
             if deal_kind == "Best Delivery %":
                 with st.spinner("Fetching latest NSE delivery report + 10-day/monthly averages (downloads up to ~40 daily reports the first time — later reruns reuse the cache and are much faster)..."):
                     st.session_state["all_deals_df"] = fetch_market_delivery_leaderboard(lookback_days=days_back)
                     st.session_state["all_deals_mode"] = "delivery"
             else:
-                with st.spinner(f"Fetching bulk/block deals for the last {days_back} days (in date chunks to avoid NSE truncation — may take a bit longer)..."):
+                with st.spinner(f"Fetching bulk/block deals for the last {days_back} days from NSE, plus today's from BSE (in date chunks to avoid NSE truncation — may take a bit longer)..."):
                     frames = []
                     if deal_kind in ("Both", "Bulk only"):
                         bdf = fetch_all_deals("bulk", days_back)
                         if not bdf.empty:
                             bdf.insert(1, "Type", "Bulk")
+                            bdf.insert(2, "Exchange", "NSE")
                             frames.append(bdf)
+                        if _BSE_LIB_AVAILABLE:
+                            bbdf = fetch_all_bse_deals("bulk")
+                            if not bbdf.empty:
+                                bbdf.insert(1, "Type", "Bulk")
+                                bbdf.insert(2, "Exchange", "BSE")
+                                frames.append(bbdf)
                     if deal_kind in ("Both", "Block only"):
                         kdf = fetch_all_deals("block", days_back)
                         if not kdf.empty:
                             kdf.insert(1, "Type", "Block")
+                            kdf.insert(2, "Exchange", "NSE")
                             frames.append(kdf)
+                        if _BSE_LIB_AVAILABLE:
+                            bkdf = fetch_all_bse_deals("block")
+                            if not bkdf.empty:
+                                bkdf.insert(1, "Type", "Block")
+                                bkdf.insert(2, "Exchange", "BSE")
+                                frames.append(bkdf)
                     combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
-                        columns=["Date", "Type", "Symbol", "Security", "Client", "Buy/Sell", "Qty", "Price"]
+                        columns=["Date", "Type", "Exchange", "Symbol", "Security", "Client", "Buy/Sell", "Qty", "Price"]
                     )
                     st.session_state["all_deals_df"] = combined
                     st.session_state["all_deals_mode"] = "deals"
@@ -4822,7 +4929,12 @@ elif page == "📢 Bulk/Block Deals":
             display_df = all_deals_df.copy()
             if search_symbol.strip():
                 q = search_symbol.strip().upper()
-                display_df = display_df[display_df["Symbol"].astype(str).str.upper().str.contains(q, na=False)]
+                sym_match = display_df["Symbol"].astype(str).str.upper().str.contains(q, na=False)
+                if "Security" in display_df.columns:
+                    sec_match = display_df["Security"].astype(str).str.upper().str.contains(q, na=False)
+                    display_df = display_df[sym_match | sec_match]
+                else:
+                    display_df = display_df[sym_match]
 
             if all_deals_mode == "delivery" and min_qty:
                 display_df = display_df[display_df["Traded Qty"].fillna(0) >= min_qty]
