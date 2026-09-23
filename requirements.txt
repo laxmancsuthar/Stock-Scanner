@@ -10,3 +10,4 @@ reportlab
 nse
 httpx[http2]
 bseindia
+google-genai
