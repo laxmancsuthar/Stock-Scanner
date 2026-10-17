@@ -1938,9 +1938,9 @@ def score_technical(t: Dict[str, Any]) -> Tuple[int, List[str], List[str], str]:
         score += 8; reasons.append(f"RSI sweet spot ({r:.1f})")
     elif 40 <= r < 50:
         score += 6; reasons.append(f"RSI recovering ({r:.1f})")
-    elif 65 < r <= 75:
+    elif 65 < r <= 80:
         score += 4; reasons.append(f"RSI strong but watch overbought ({r:.1f})")
-    elif r > 75:
+    elif r > 80:
         flags.append(f"RSI overbought ({r:.1f})")
     else:
         flags.append(f"RSI weak ({r:.1f})")
@@ -2537,6 +2537,345 @@ def _get_table_row(table_data: Dict[str, List[Optional[float]]], keys: List[str]
             if k.lower() in label.lower():
                 return vals
     return None
+
+
+_BSE_ANN_HEADERS = {
+    "authority": "api.bseindia.com",
+    "accept": "application/json, text/plain, */*",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "origin": "https://www.bseindia.com",
+    "referer": "https://www.bseindia.com/",
+}
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def _bse_get_scrip_code(base_symbol: str) -> Optional[str]:
+    """Resolves a trading symbol (e.g. 'RELIANCE') to its numeric BSE scrip
+    code (e.g. '500325'), needed for BSE's own announcements API — BSE has
+    no direct symbol-based lookup, only scrip-code based. Free, no API key,
+    but this is an undocumented/unofficial BSE endpoint, so it's wrapped
+    defensively and returns None (not an exception) on any failure."""
+    try:
+        resp = requests.get(
+            "https://api.bseindia.com/Msource/1D/getQouteSearch.aspx",
+            params={"Type": "EQ", "text": base_symbol, "flag": "site"},
+            headers=_BSE_ANN_HEADERS, timeout=10,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.content, "html.parser")
+        a_tag = soup.find("a")
+        if not a_tag or not a_tag.get("href"):
+            return None
+        m = re.search(r"/(\d+)/", a_tag["href"])
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _bse_fetch_last_result_announcement(base_symbol: str, lookback_days: int = 400) -> Optional[Dict[str, str]]:
+    """BSE fallback for fetch_last_result_announcement — tried only when the
+    NSE lookup above finds nothing (NSE blocked/rate-limited, or genuinely
+    no recent result there). Free, no API key, same best-effort/never-raise
+    contract as the NSE version. BSE's own field names for this endpoint
+    aren't officially documented, so several common key spellings are tried
+    for each field."""
+    scrip_code = _bse_get_scrip_code(base_symbol)
+    if not scrip_code:
+        return None
+
+    to_date = datetime.now()
+    from_date = to_date - timedelta(days=lookback_days)
+    try:
+        resp = requests.get(
+            "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w",
+            params={
+                "pageno": 1, "strCat": "-1", "strPrevDate": from_date.strftime("%Y%m%d"),
+                "strScrip": scrip_code, "strSearch": "P", "strToDate": to_date.strftime("%Y%m%d"),
+                "strType": "C", "subcategory": "-1",
+            },
+            headers=_BSE_ANN_HEADERS, timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return None
+
+    rows = data.get("Table") if isinstance(data, dict) else data
+    if not rows:
+        return None
+
+    result_keywords = ("financial result", "un-audited", "unaudited", "audited financial")
+    best_dt, best_desc = None, ""
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        desc = (
+            row.get("NEWSSUB") or row.get("HEADLINE") or row.get("News_Sub")
+            or row.get("Headline") or row.get("SUBJECT") or ""
+        )
+        if not any(kw in desc.lower() for kw in result_keywords):
+            continue
+        dt_str = (
+            row.get("NEWS_DT") or row.get("News_DT") or row.get("DT_TM")
+            or row.get("DissemDT") or row.get("News_submission_dt") or ""
+        )
+        dt = pd.to_datetime(dt_str, errors="coerce")
+        if pd.isna(dt):
+            continue
+        dt_naive = dt.to_pydatetime().replace(tzinfo=None)
+        if best_dt is None or dt_naive > best_dt:
+            best_dt, best_desc = dt_naive, desc.strip()
+
+    if best_dt is None:
+        return None
+    return {
+        "date": best_dt.strftime("%d %b %Y"),
+        "raw_date": best_dt.strftime("%Y-%m-%d"),
+        "desc": best_desc[:180],
+    }
+
+
+def _legacy_last_result_announcement(symbol: str, lookback_days: int = 400) -> Optional[Dict[str, str]]:
+    """Most recent 'Financial Results' corporate announcement for this stock.
+    Tries NSE's public corporate-announcements API first (same cookie-
+    warm-up pattern used elsewhere in this app for NSE calls); if that finds
+    nothing (NSE often bot-blocks/rate-limits), falls back to BSE's own
+    public announcements API. Both are free — no API key involved anywhere
+    in this function. Returns {'date': 'DD Mon YYYY' (display), 'raw_date':
+    'YYYY-MM-DD' (for lookups), 'desc': short text} or None if neither
+    exchange's data has anything — this is best-effort, not a scanning-logic
+    input, so a miss should never break the rest of the detail view/PDF."""
+    base = symbol.replace(".NS", "").strip().upper()
+    session = requests.Session()
+    session.headers.update(NSE_HEADERS)
+    try:
+        session.get("https://www.nseindia.com", timeout=8)  # warms up cookies, NSE requires this
+        resp = session.get(
+            "https://www.nseindia.com/api/corporate-announcements",
+            params={"index": "equities", "symbol": base},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        data = None
+
+    cutoff = datetime.now() - timedelta(days=lookback_days)
+    result_keywords = ("financial result", "un-audited", "unaudited", "audited financial")
+    best_dt, best_desc = None, ""
+    for row in data if isinstance(data, list) else []:
+        desc = (row.get("desc") or row.get("subject") or row.get("attchmntText") or "")
+        if not any(kw in desc.lower() for kw in result_keywords):
+            continue
+        dt_str = row.get("an_dt") or row.get("sm_dt") or row.get("date") or ""
+        dt = pd.to_datetime(dt_str, errors="coerce")
+        if pd.isna(dt):
+            continue
+        dt_naive = dt.to_pydatetime().replace(tzinfo=None)
+        if dt_naive < cutoff:
+            continue
+        if best_dt is None or dt_naive > best_dt:
+            best_dt, best_desc = dt_naive, desc.strip()
+
+    if best_dt is None:
+        return _bse_fetch_last_result_announcement(base, lookback_days)  # NSE had nothing — try BSE (also free, no key)
+    return {
+        "date": best_dt.strftime("%d %b %Y"),
+        "raw_date": best_dt.strftime("%Y-%m-%d"),
+        "desc": best_desc[:180],
+    }
+
+
+_NSE_API_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/",
+}
+
+
+def _nse_board_meeting_result_dates(base: str) -> List[Tuple[pd.Timestamp, str]]:
+    """(date, purpose) for every 'results' board meeting NSE lists for this
+    symbol (past + upcoming). Raises on network/parse failure so the caller
+    can fall back without caching the failure."""
+    session = requests.Session()
+    session.headers.update(_NSE_API_HEADERS)
+    session.get("https://www.nseindia.com", timeout=15)  # cookie warm-up
+    resp = session.get(
+        "https://www.nseindia.com/api/corporate-board-meetings",
+        params={"index": "equities", "symbol": base}, timeout=15,
+    )
+    resp.raise_for_status()
+    out: List[Tuple[pd.Timestamp, str]] = []
+    for row in resp.json():
+        purpose = f"{row.get('bm_purpose', '')} {row.get('bm_desc', '')}".strip()
+        if "result" not in purpose.lower():
+            continue
+        d = pd.to_datetime(row.get("bm_date"), errors="coerce", dayfirst=True)
+        if pd.notna(d):
+            out.append((d.normalize(), purpose))
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def _result_info_cached(symbol: str, lookback_days: int) -> Dict[str, Any]:
+    """Raises LookupError when nothing is found, so a failed/blocked lookup
+    is NOT cached (st.cache_data never caches exceptions)."""
+    base = symbol.replace(".NS", "").strip().upper()
+    today = pd.Timestamp(datetime.now().date())
+
+    meetings: List[Tuple[pd.Timestamp, str]] = []
+    try:
+        meetings = _nse_board_meeting_result_dates(base)
+    except Exception:
+        meetings = []
+
+    past = [m for m in meetings if m[0] <= today]
+    upcoming = sorted(m[0] for m in meetings if m[0] > today)
+    next_date = upcoming[0].strftime("%d %b %Y") if upcoming else None
+
+    if past:
+        d, purpose = max(past, key=lambda m: m[0])  # last declared result only
+        return {
+            "date": d.strftime("%d %b %Y"),
+            "raw_date": d.strftime("%Y-%m-%d"),
+            "desc": purpose[:180],
+            "next_date": next_date,
+        }
+
+    legacy = _legacy_last_result_announcement(base, lookback_days)  # announcements API, then BSE
+    if legacy:
+        legacy = dict(legacy)
+        legacy["next_date"] = next_date
+        return legacy
+    raise LookupError("no result date found")
+
+
+def fetch_last_result_announcement(symbol: str, lookback_days: int = 400) -> Optional[Dict[str, Any]]:
+    """Last declared result date for this stock (NSE board meetings first,
+    then NSE announcements, then BSE). Returns {'date', 'raw_date', 'desc',
+    'next_date'} or None. Never raises; misses are not cached."""
+    try:
+        return _result_info_cached(symbol, lookback_days)
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def _all_result_dates_cached(symbol: str) -> List[str]:
+    """All 'results' board-meeting dates (YYYY-MM-DD, oldest -> newest, past +
+    upcoming) from NSE. Duplicate/rescheduled entries within 30 days are merged
+    (later date kept). Raises on failure so misses are never cached."""
+    base = symbol.replace(".NS", "").strip().upper()
+    meetings = _nse_board_meeting_result_dates(base)
+    dates = sorted({m[0] for m in meetings})
+    merged: List[pd.Timestamp] = []
+    for d in dates:
+        if merged and (d - merged[-1]).days < 30:
+            merged[-1] = d
+        else:
+            merged.append(d)
+    if not merged:
+        raise LookupError("no result dates found")
+    return [d.strftime("%Y-%m-%d") for d in merged]
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def _quarter_moves_cached(symbol: str) -> Dict[str, Any]:
+    """Quarter-to-quarter move: close on result date N -> close on result date
+    N+1. The latest result runs to the most recent close ('ongoing').
+    Raises on any failure so nothing bad is cached."""
+    dates = [pd.Timestamp(x) for x in _all_result_dates_cached(symbol)]
+    today = pd.Timestamp(datetime.now().date())
+    past = [d for d in dates if d <= today]
+    upcoming = [d for d in dates if d > today]
+    if not past:
+        raise LookupError("no declared results yet")
+
+    hist = _yf_history_with_retry(symbol, period="5y", auto_adjust=False)
+    if hist is None or hist.empty:
+        raise LookupError("no price history")
+    hist = hist.sort_index()
+    idx = hist.index.tz_localize(None) if hist.index.tz is not None else hist.index
+    close = pd.Series(hist["Close"].to_numpy(dtype=float), index=idx.normalize())
+    latest_date, latest_close = close.index[-1], float(close.iloc[-1])
+
+    def _close_on_or_before(d: pd.Timestamp):
+        upto = close[close.index <= d]
+        if upto.empty:
+            return None, None
+        return upto.index[-1], float(upto.iloc[-1])
+
+    rows: List[Dict[str, Any]] = []
+    for i, d in enumerate(past):
+        base_date, base_close = _close_on_or_before(d)
+        if base_date is None or not base_close:
+            continue
+        if i + 1 < len(past):
+            end_date, end_close = _close_on_or_before(past[i + 1])
+            status = "Completed"
+        else:
+            end_date, end_close, status = latest_date, latest_close, "Ongoing"
+        if end_date is None or end_date <= base_date:
+            continue
+        rows.append({
+            "result_date": d.strftime("%d %b %Y"),
+            "base_close": base_close,
+            "end_date": end_date.strftime("%d %b %Y"),
+            "end_close": end_close,
+            "pct": (end_close - base_close) / base_close * 100,
+            "status": status,
+        })
+    if not rows:
+        raise LookupError("could not match result dates with price history")
+    return {"rows": rows, "next_date": upcoming[0].strftime("%d %b %Y") if upcoming else None}
+
+
+def fetch_quarter_to_quarter_moves(symbol: str) -> Optional[Dict[str, Any]]:
+    """{'rows': [...oldest->newest], 'next_date': str|None} or None. Never raises."""
+    try:
+        return _quarter_moves_cached(symbol)
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def compute_price_change_since(symbol: str, since_date_str: str) -> Optional[Dict[str, Any]]:
+    """% price change from `since_date_str` (YYYY-MM-DD, e.g. a result
+    declaration date) to the most recent close. Reuses the app's existing
+    throttled/retried yfinance history gateway (_yf_history_with_retry) —
+    just fetches a period long enough to cover the requested date, so no new
+    scraping target is added, only a longer lookback on an existing one."""
+    try:
+        since_dt = pd.to_datetime(since_date_str)
+    except Exception:
+        return None
+    days_needed = (datetime.now() - since_dt.to_pydatetime().replace(tzinfo=None)).days + 15
+    period = "2y" if days_needed > 300 else "1y"
+    hist = _yf_history_with_retry(symbol, period=period, auto_adjust=False)
+    if hist is None or hist.empty:
+        return None
+    hist = hist.sort_index()
+    # Anchor = closing price of the result date itself. If that date wasn't a
+    # trading day (weekend/holiday), use the last trading close before it.
+    hist_idx = hist.index.tz_localize(None) if hist.index.tz is not None else hist.index
+    on_or_before = hist_idx[hist_idx <= since_dt]
+    if len(on_or_before) == 0:
+        return None
+    base_date_actual = hist.index[len(on_or_before) - 1]
+    base_close = float(hist.loc[base_date_actual, "Close"])
+    latest_date_actual = hist.index[-1]
+    latest_close = float(hist["Close"].iloc[-1])
+    if not base_close:
+        return None
+    return {
+        "base_date": base_date_actual.strftime("%d %b %Y"),
+        "base_close": base_close,
+        "latest_date": latest_date_actual.strftime("%d %b %Y"),
+        "latest_close": latest_close,
+        "pct_change": (latest_close - base_close) / base_close * 100,
+    }
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
@@ -3274,6 +3613,45 @@ def build_stock_report(candidate: dict, smart: Optional[Dict[str, Any]] = None) 
     story.append(Spacer(1, 8))
 
     # ---------------------------------------------------------------
+    # Last Result Declared + price change since that date (NSE announcement
+    # date + yfinance price lookup — best-effort, skipped silently if either
+    # lookup fails so it never breaks the rest of the report).
+    # ---------------------------------------------------------------
+    try:
+        pdf_result_info = fetch_last_result_announcement(candidate.get("base_symbol", ""))
+    except Exception:
+        pdf_result_info = None
+    if pdf_result_info:
+        try:
+            pdf_price_since = compute_price_change_since(candidate.get("symbol", ""), pdf_result_info["raw_date"])
+        except Exception:
+            pdf_price_since = None
+        story.append(_metric_row(
+            [
+                ("Last Result Declared", pdf_result_info["date"]),
+                ("Next Result Date", pdf_result_info.get("next_date") or "—"),
+            ],
+            content_w / 2,
+        ))
+        if pdf_price_since and pdf_price_since.get("pct_change") is not None:
+            result_change_color = PDF_GREEN if pdf_price_since["pct_change"] >= 0 else PDF_RED
+            story.append(_metric_row(
+                [
+                    (f"Close on result date ({pdf_price_since['base_date']})",
+                     _fmt(pdf_price_since["base_close"], "₹")),
+                    (f"Latest close ({pdf_price_since['latest_date']})",
+                     f"{_fmt(pdf_price_since['latest_close'], '₹')}  ({pdf_price_since['pct_change']:+.2f}%)"),
+                ],
+                content_w / 2, value_colors={1: result_change_color},
+            ))
+        else:
+            story.append(_metric_row(
+                [("Close on result date", "—"), ("Latest close", "—")],
+                content_w / 2,
+            ))
+        story.append(Spacer(1, 8))
+
+    # ---------------------------------------------------------------
     # Chart (mirrors the on-screen detail-view chart, with trade-plan levels)
     # ---------------------------------------------------------------
     plan = candidate.get("trade_plan", {}) or {}
@@ -3408,6 +3786,47 @@ def build_stock_report(candidate: dict, smart: Optional[Dict[str, Any]] = None) 
             ))
     else:
         story.append(Paragraph("Smart Scanner score could not be computed for this stock.", muted_italic))
+    story.append(Spacer(1, 14))
+
+    # ---------------------------------------------------------------
+    # Result Reaction — Quarter-to-Quarter move (mirrors the on-screen
+    # "Result Reaction" expander). Best-effort: if NSE/Yahoo lookups fail the
+    # section shows a short note and the rest of the report is unaffected.
+    # ---------------------------------------------------------------
+    story.append(Paragraph("Result Reaction — Quarter-to-Quarter Move", h2))
+    try:
+        pdf_qq = fetch_quarter_to_quarter_moves(candidate.get("symbol", ""))
+    except Exception:
+        pdf_qq = None
+    if pdf_qq and pdf_qq.get("rows"):
+        qq_pdf_rows = []
+        for r in reversed(pdf_qq["rows"][-8:]):  # newest first, last 8 quarters
+            col = PDF_GREEN if r["pct"] >= 0 else PDF_RED
+            qq_pdf_rows.append([
+                r["result_date"],
+                _fmt(r["base_close"], "₹"),
+                r["end_date"] + (" (latest)" if r["status"] == "Ongoing" else ""),
+                _fmt(r["end_close"], "₹"),
+                f"<font color='{col}'><b>{r['pct']:+.2f}%</b></font>",
+                r["status"],
+            ])
+        story.append(_data_table(
+            ["Result Date", "Close on Result Date", "Period End", "Close at Period End", "Move", "Status"],
+            qq_pdf_rows,
+            [content_w * 0.16, content_w * 0.17, content_w * 0.22, content_w * 0.17, content_w * 0.14, content_w * 0.14],
+        ))
+        story.append(Spacer(1, 4))
+        story.append(Paragraph(
+            "Move = (close at next result date − close on result date) / close on result date. "
+            "The latest result is 'Ongoing' and runs to the most recent close."
+            + (f" <b>Next result date: {pdf_qq['next_date']}</b>" if pdf_qq.get("next_date") else ""),
+            muted_italic,
+        ))
+    else:
+        story.append(Paragraph(
+            "Quarter-to-quarter result data not available (NSE result dates or price history could not be fetched).",
+            muted_italic,
+        ))
     story.append(Spacer(1, 14))
 
     # ---------------------------------------------------------------
@@ -3774,12 +4193,17 @@ def render_news_article_card(item: dict):
 
 # ============================================================================
 # SECTION 4B: AI DEEP DIVE — combines everything this app already fetches
-# (technical/fundamental score, Screener.in financials + shareholding, news
-# sentiment) into one prompt, sends it to Gemini (Google's free-tier API),
-# and shows a structured research summary. No new scraping is added here —
-# it reuses the same cached functions the rest of the app already calls,
-# so it costs nothing extra in scraping load, only one Gemini API call per
-# stock (cached).
+# (technical/fundamental score, Screener.in financials + balance sheet +
+# cash flow + ratios + peers + shareholding, NSE corporate announcements,
+# news sentiment) into one detailed 8-section research prompt, sends it to
+# Gemini (Google's free-tier API), and shows a structured research report.
+# No new scraping TARGET is added beyond the extra sections on the SAME
+# already-cached Screener.in page (balance-sheet/cash-flow/ratios/peers —
+# same HTML, same throttle, same session as the rest of the app already
+# uses) plus one lightweight reuse of the existing Yahoo info gateway for
+# two ratios (P/B, EV/EBITDA) that Screener's ratio box doesn't carry.
+# SCANNING/SCORING LOGIC ITSELF (score_technical, score_fundamental, the
+# scanners, filters, PDF export, etc.) IS NOT TOUCHED.
 # ============================================================================
 
 import os
@@ -3792,8 +4216,13 @@ import os
 # fine for local testing, but do NOT share this file or upload it anywhere
 # (GitHub, forums, back to Claude, etc.) once your real key is in it, since
 # anyone with the file could use your key and run up your bill.
+# NOTE: a real-looking key was found hardcoded here and has been removed for
+# your safety — if that key is genuine, treat it as compromised (anyone who
+# had this file could use it) and rotate/delete it at
+# https://aistudio.google.com/apikey, then paste a fresh one below or use
+# secrets.toml instead.
 # ---------------------------------------------------------------------------
-GEMINI_API_KEY_HARDCODED = "PASTE API KEY HERE"  # <-- paste your Gemini key here, e.g. "AQ.Ab8..."
+GEMINI_API_KEY_HARDCODED = "....."  # <-- paste your Gemini key here, e.g. "AQ.Ab8..."
 
 # Prefer Streamlit secrets (.streamlit/secrets.toml -> GEMINI_API_KEY = "...")
 # Falls back to an environment variable of the same name if secrets aren't set up.
@@ -3956,21 +4385,270 @@ def deepdive_fetch_recent_deals(symbol: str, days: int = 30) -> List[Dict[str, s
     return [{"title": a["title"], "source": a["source"]} for a in deal_items[:8]]
 
 
+# ----------------------------------------------------------------------------
+# NEW (deep-dive-only) data helpers below. Every one of these reuses the same
+# cached Screener.in HTML (_fetch_screener_soup / _get_screener_html_cached)
+# or the same throttled Yahoo gateway (_yf_info_with_retry) the rest of the
+# app already relies on — nothing new is scraped, just more sections of the
+# SAME page are parsed, and none of this touches the technical/fundamental
+# scanning or scoring engine.
+# ----------------------------------------------------------------------------
+
+def _screener_period_labels(html: str, section_id: str) -> List[str]:
+    """Column headers (quarter/year labels, e.g. 'Mar 2024') for a Screener
+    table section. The generic _parse_screener_table intentionally skips the
+    header row (it holds period labels, not numeric data) — deep dive needs
+    those labels for readable tables, so this re-reads just that one row."""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+    section = soup.find("section", {"id": section_id})
+    if not section:
+        return []
+    table = section.find("table")
+    if not table:
+        return []
+    rows = table.find_all("tr")
+    if not rows:
+        return []
+    cells = rows[0].find_all(["th", "td"])
+    return [c.get_text(strip=True) for c in cells[1:]]
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def deepdive_fetch_multi_year_statements(symbol: str, years: int = 5) -> Dict[str, Any]:
+    """Last `years` annual columns of Screener's Profit & Loss, Balance Sheet
+    and Cash Flow tables (same cached HTML, same generic table parser this
+    app already uses for the quarterly view — just two more section ids:
+    'balance-sheet' and a wider slice of 'profit-loss'/'cash-flow')."""
+    html = _fetch_screener_soup(symbol)
+    if not html:
+        return {}
+    pnl = _parse_screener_table(html, "profit-loss")
+    bs = _parse_screener_table(html, "balance-sheet")
+    cf = _parse_screener_table(html, "cash-flow")
+
+    def trim(table: Dict[str, List[Optional[float]]]) -> Dict[str, List[Optional[float]]]:
+        return {label: vals[-years:] for label, vals in table.items() if vals}
+
+    return {
+        "periods": {
+            "profit_loss": _screener_period_labels(html, "profit-loss")[-years:],
+            "balance_sheet": _screener_period_labels(html, "balance-sheet")[-years:],
+            "cash_flow": _screener_period_labels(html, "cash-flow")[-years:],
+        },
+        "profit_loss": trim(pnl),
+        "balance_sheet": trim(bs),
+        "cash_flow": trim(cf),
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def deepdive_fetch_last_n_quarters(symbol: str, n: int = 3) -> Dict[str, Any]:
+    """Last `n` quarters' absolute Sales / Operating Profit / OPM% / Net
+    Profit / EPS (not just the QoQ/YoY delta the rest of the app shows) —
+    same 'quarters' Screener section, same cached HTML."""
+    html = _fetch_screener_soup(symbol)
+    if not html:
+        return {}
+    q = _parse_screener_table(html, "quarters")
+    labels = _screener_period_labels(html, "quarters")[-n:]
+    rows: Dict[str, List[Optional[float]]] = {}
+    for label, keys in [
+        ("Sales", ["Sales", "Revenue"]),
+        ("Operating Profit", ["Operating Profit"]),
+        ("OPM %", ["OPM"]),
+        ("Net Profit", ["Net Profit", "Profit after tax"]),
+        ("EPS (Rs)", ["EPS in Rs", "EPS"]),
+    ]:
+        vals = _get_table_row(q, keys)
+        if vals:
+            rows[label] = vals[-n:]
+    return {"periods": labels, "values": rows}
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def deepdive_fetch_shareholding_trend(symbol: str, quarters: int = 8) -> Dict[str, Any]:
+    """Promoter / FII / DII / Public / Pledged trend across the last several
+    quarters (the rest of the app only keeps the latest 2 for its quick red-
+    flag check) — same 'shareholding' Screener section, same cached HTML.
+    Pledged % is a separate row on Screener only when applicable; if the
+    company has zero pledge, this row is usually absent — that is a good
+    sign, not a scraping failure, and is treated as such in the prompt."""
+    html = _fetch_screener_soup(symbol)
+    if not html:
+        return {}
+    sh = _parse_screener_table(html, "shareholding")
+    labels = _screener_period_labels(html, "shareholding")[-quarters:]
+    out: Dict[str, List[Optional[float]]] = {}
+    for prefix, keys in [
+        ("Promoter %", ["Promoters", "Promoter"]),
+        ("FII %", ["FII", "Foreign", "FPI"]),
+        ("DII %", ["DII", "Domestic Institution"]),
+        ("Public %", ["Public"]),
+        ("Pledged % (of promoter holding)", ["Pledged", "Pledge"]),
+    ]:
+        vals = _get_table_row(sh, keys)
+        if vals:
+            out[prefix] = vals[-quarters:]
+    return {"periods": labels, "values": out}
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def deepdive_fetch_top_ratios(symbol: str) -> Dict[str, str]:
+    """Screener's top ratio box (Market Cap, Current Price, Stock P/E, Book
+    Value, ROCE, ROE, Dividend Yield, Face Value, High/Low, etc.) — this is
+    a <ul>, not a <table>, so the generic table parser doesn't cover it;
+    same cached HTML, just a different DOM element on the same page.
+    Screener computes ROCE/ROE itself from full financials, which is more
+    reliable for Indian filings than deriving it from Yahoo's info dict."""
+    html = _fetch_screener_soup(symbol)
+    if not html:
+        return {}
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+    ul = soup.find("ul", {"id": "top-ratios"})
+    if not ul:
+        return {}
+    out: Dict[str, str] = {}
+    for li in ul.find_all("li"):
+        name_el = li.find(class_="name")
+        val_el = li.find(class_="value") or li.find(class_="number")
+        if name_el and val_el:
+            name = name_el.get_text(strip=True)
+            val = re.sub(r"\s+", " ", val_el.get_text(" ", strip=True)).strip()
+            if name and val:
+                out[name] = val
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def deepdive_fetch_peer_comparison(symbol: str, max_peers: int = 8) -> List[Dict[str, str]]:
+    """Screener's 'Peer comparison' table — same page, same cached HTML, no
+    new scraping target — parsed into a list of {column: value} dicts, one
+    row per peer company (CMP, P/E, Market Cap, ROCE, Div Yield, Sales/NP
+    with QoQ variance, etc., exactly as Screener presents it). Median/
+    average summary rows are skipped since those aren't a company."""
+    html = _fetch_screener_soup(symbol)
+    if not html:
+        return []
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+    section = soup.find("section", {"id": "peers"})
+    if not section:
+        return []
+    table = section.find("table")
+    if not table:
+        return []
+    thead = table.find("thead")
+    header_cells = thead.find_all("th") if thead else table.find_all("tr")[0].find_all(["th", "td"])
+    headers = [h.get_text(strip=True) for h in header_cells]
+    body = table.find("tbody") or table
+    peers: List[Dict[str, str]] = []
+    for row in body.find_all("tr"):
+        cols = row.find_all("td")
+        if len(cols) < 2:
+            continue
+        texts = [c.get_text(strip=True) for c in cols]
+        name = texts[1] if len(texts) > 1 else texts[0]
+        if not name or name.lower().startswith(("median", "average", "sum", "add ratio")):
+            continue
+        row_dict = {h: v for h, v in zip(headers, texts) if h and h.strip().lower() not in ("s.no", "")}
+        if row_dict:
+            peers.append(row_dict)
+        if len(peers) >= max_peers:
+            break
+    return peers
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def deepdive_fetch_extra_valuation(symbol: str) -> Dict[str, Any]:
+    """Two ratios Screener's ratio box doesn't carry (P/B, EV/EBITDA) —
+    pulled via the app's existing throttled/retried Yahoo info gateway
+    (_yf_info_with_retry), the same one the fundamental scanner already
+    calls. Not a new data source, just two extra fields read off it."""
+    info = _yf_info_with_retry(symbol) or {}
+    if not info:
+        return {}
+    return {
+        "price_to_book": info.get("priceToBook"),
+        "ev_to_ebitda": info.get("enterpriseToEbitda"),
+        "quick_ratio": info.get("quickRatio"),
+    }
+
+
 def deepdive_build_context(symbol: str, c: Dict[str, Any], smart: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Pulls together everything this app already knows about the stock —
-    no fresh scraping, just reusing already-cached results — into one plain
-    dict that gets serialized into the AI prompt."""
+    """Pulls together everything this app already knows about the stock, plus
+    the deep-dive-only helpers above, into one plain dict that gets
+    serialized into the AI prompt. `c["technical"]` and `c["fundamentals"]`
+    are the SAME dicts the scanner already computed for this stock (no
+    re-computation, no change to that logic) — reused here as-is."""
+    base = c["base_symbol"]
     fin_data = fetch_quarterly_yearly_financials(c["symbol"]) or {}
     sh_filings = fetch_shareholding_filings(c["symbol"]) or []
     news = news_get_analysis(
-        c["base_symbol"], api_key=NEWSAPI_KEY, days=7
+        base, api_key=NEWSAPI_KEY, days=7
     ) if NEWSAPI_KEY else {}
-    corp_announcements = deepdive_fetch_corp_announcements(c["base_symbol"])
-    recent_deals = deepdive_fetch_recent_deals(c["base_symbol"])
+    corp_announcements = deepdive_fetch_corp_announcements(base)
+    recent_deals = deepdive_fetch_recent_deals(base)
+
+    statements_5y = deepdive_fetch_multi_year_statements(base, years=5)
+    last_3_quarters = deepdive_fetch_last_n_quarters(base, n=3)
+    shareholding_trend = deepdive_fetch_shareholding_trend(base, quarters=8)
+    top_ratios = deepdive_fetch_top_ratios(base)
+    peer_comparison = deepdive_fetch_peer_comparison(base, max_peers=8)
+    extra_valuation = deepdive_fetch_extra_valuation(c["symbol"])
+
+    t = c.get("technical") or {}
+    f = c.get("fundamentals") or {}
+
+    technical_snapshot = {
+        "trend_structure": {
+            "price": t.get("price"),
+            "ema9": t.get("ema9"), "ema20": t.get("ema20"),
+            "ema50": t.get("ema50"), "ema200": t.get("ema200"),
+            "ema_stack_bullish": passes_ema_stack(t) if t else None,
+        },
+        "support": t.get("support"),
+        "resistance": t.get("resistance"),
+        "adx": t.get("adx"), "plus_di": t.get("plus_di"), "minus_di": t.get("minus_di"),
+        "weekly_trend_up": t.get("weekly_trend_up"),
+        "monthly_trend_up": t.get("monthly_trend_up"),
+        "distance_from_52w_high_pct": t.get("distance_from_52w_high_pct"),
+        "hi_52w": t.get("hi_52w"), "lo_52w": t.get("lo_52w"),
+        "breakout_status": (t.get("breakout") or {}).get("status"),
+        "volume_ratio_vs_20d_avg": t.get("volume_ratio"),
+    } if t else None
+
+    valuation_ratios = {
+        "pe_scanner": f.get("pe"),
+        "price_to_book": extra_valuation.get("price_to_book"),
+        "ev_to_ebitda": extra_valuation.get("ev_to_ebitda"),
+        "roe_pct_scanner": f.get("roe_pct"),
+        "profit_margin_pct": f.get("profit_margin_pct"),
+        "operating_margin_pct": f.get("operating_margin_pct"),
+        "debt_to_equity": f.get("debt_to_equity_val"),
+        "current_ratio": f.get("current_ratio"),
+        "quick_ratio": extra_valuation.get("quick_ratio"),
+        "revenue_growth_pct": f.get("revenue_growth_pct"),
+        "earnings_growth_pct": f.get("earnings_growth_pct"),
+        "operating_cashflow_positive": (f.get("operating_cashflow") or 0) > 0 if f.get("operating_cashflow") is not None else None,
+        "market_cap": f.get("market_cap"),
+        "book_value": f.get("book_value"),
+        "eps": f.get("eps"),
+        "dividend_yield": f.get("dividend_yield"),
+        "beta": f.get("beta"),
+        "screener_top_ratios": top_ratios,  # Market Cap, Stock P/E, ROCE, ROE, Book Value, Div Yield, Face Value etc, straight from Screener
+    }
 
     return {
-        "company_name": c.get("name", c["base_symbol"]),
-        "ticker": c["base_symbol"],
+        "company_name": c.get("name", base),
+        "ticker": base,
         "sector": c.get("sector", "—"),
         "industry": c.get("industry", "—"),
         "cmp": c.get("price"),
@@ -3985,8 +4663,14 @@ def deepdive_build_context(symbol: str, c: Dict[str, Any], smart: Optional[Dict[
             "strength": (smart or {}).get("strengthScore"),
             "red_flags": sm_compute_red_flags((smart or {}).get("fund_data") or {}),
         } if smart else None,
+        "technical_snapshot": technical_snapshot,
+        "valuation_ratios": valuation_ratios,
+        "statements_last_5_years": statements_5y,
+        "last_3_quarters_absolute": last_3_quarters,
         "quarterly_annual_financials_qoq_yoy": fin_data,
-        "shareholding_pattern": sh_filings[0] if sh_filings else {},
+        "shareholding_pattern_latest": sh_filings[0] if sh_filings else {},
+        "shareholding_trend_last_8_quarters": shareholding_trend,
+        "peer_comparison": peer_comparison,
         "recent_news_summary": {
             "sentiment": news.get("overall_sentiment"),
             "confidence": news.get("overall_confidence"),
@@ -4000,31 +4684,54 @@ def deepdive_build_context(symbol: str, c: Dict[str, Any], smart: Optional[Dict[
 
 def deepdive_build_prompt(ctx: Dict[str, Any], concall_prev: str = "", concall_latest: str = "") -> str:
     """Fills the deep-dive template with the gathered context. `concall_prev`
-    and `concall_latest` are optional free text the user can paste in (this
-    app doesn't scrape concall transcripts automatically — BSE/NSE
-    announcement PDFs and company IR pages aren't wired up yet). Giving both
-    lets the model compare guidance-vs-delivery across the two calls."""
+    and `concall_latest` are optional free text the user can paste in, or
+    auto-fetched from Screener's Concalls section. The report structure below
+    mirrors the user's own 8-section research checklist (Company Overview,
+    Fundamental Analysis, Last-3-Quarters, Industry & Macro, Management &
+    Governance, Qualitative & Growth Catalysts, Technicals & Entry, and a
+    final Key Metric + Peer Comparison table)."""
     concall_prev_block = concall_prev.strip() if concall_prev.strip() else "Not provided by user."
     concall_latest_block = concall_latest.strip() if concall_latest.strip() else "Not provided by user."
 
-    return f"""Tum ek equity research analyst ho jo Indian stock market ke liye detailed, balanced aur risk-aware analysis karta hai. Tum kabhi buy/sell recommendation nahi dete — sirf factual analysis aur risk highlight karte ho taaki investor khud informed decision le sake.
+    return f"""Tum ek senior equity research analyst ho jo Indian stock market (NSE/BSE listed companies) ke liye detailed, balanced aur risk-aware "Deep Dive" research reports banate ho. Tum kabhi buy/sell recommendation, target price, ya guaranteed-return jaisi language use nahi karte — sirf factual analysis aur risk highlight karte ho taaki investor khud informed decision le sake.
 
+Neeche is app ke apne data (technical/fundamental scanner, Screener.in ke Profit & Loss / Balance Sheet / Cash Flow / Ratios / Peer-comparison / Shareholding tables, NSE corporate announcements, news sentiment) diya gaya hai. Jahan yeh scraped data kisi qualitative cheez (jaise business model ka detail, competitive moat, TAM/industry growth potential, capital allocation history, corporate governance track record, ya growth catalysts) ko cover nahi karta, wahan apna general knowledge is company/sector ke baare mein use karo — lekin aisi har jagah clearly likho ki yeh tumhara general knowledge hai, scraped data nahi (e.g. "[AI general knowledge — khud verify karein]"), taaki investor pata kar sake ki kya hard data hai aur kya inference/context hai. Kabhi bhi numbers khud se mat banao — agar koi specific number data mein nahi hai to "Data available nahi hai" likho.
+
+=== STOCK IDENTIFICATION ===
 Stock: {ctx['company_name']} ({ctx['ticker']})
 Sector: {ctx['sector']} / {ctx['industry']}
 CMP: ₹{ctx['cmp']}
 
-=== SCANNER SCORES (from this app's own technical/fundamental engine) ===
+=== SCANNER SCORES (is app ke apne technical/fundamental engine se) ===
 Technical Score: {ctx['technical_score']}/100
 Fundamental Score: {ctx['fundamental_score']}/100
 Scanner Reasons (positive): {ctx['scanner_reasons']}
 Scanner Red Flags: {ctx['scanner_red_flags']}
 Smart Scanner (momentum/trend/strength): {ctx['smart_scanner']}
 
-=== QUARTERLY/ANNUAL FINANCIALS (QoQ & YoY %, from Screener.in) ===
+=== VALUATION & PROFITABILITY RATIOS (scanner ke fundamentals + Screener.in ke top-ratios box se) ===
+{ctx['valuation_ratios']}
+
+=== PROFIT & LOSS / BALANCE SHEET / CASH FLOW — LAST 5 YEARS (Screener.in, annual columns, oldest→newest) ===
+{ctx['statements_last_5_years']}
+
+=== LAST 3 QUARTERS — ABSOLUTE SALES/OPM/NET PROFIT/EPS (Screener.in 'quarters' table, oldest→newest of the 3) ===
+{ctx['last_3_quarters_absolute']}
+
+=== QUARTERLY & ANNUAL QoQ/YoY % CHANGE (from this app's existing financials fetch) ===
 {ctx['quarterly_annual_financials_qoq_yoy']}
 
-=== SHAREHOLDING PATTERN (QoQ, from Screener.in) ===
-{ctx['shareholding_pattern']}
+=== SHAREHOLDING — LATEST QoQ SNAPSHOT ===
+{ctx['shareholding_pattern_latest']}
+
+=== SHAREHOLDING — LAST 8 QUARTERS TREND (Promoter/FII/DII/Public %, Pledged % if any) ===
+{ctx['shareholding_trend_last_8_quarters']}
+
+=== PEER COMPARISON TABLE (Screener.in 'Peers' section — same sector companies) ===
+{ctx['peer_comparison']}
+
+=== TECHNICAL SNAPSHOT (trend structure, support/resistance, ADX/DI, weekly/monthly trend, breakout state) ===
+{ctx['technical_snapshot']}
 
 === RECENT NEWS SENTIMENT (last 7 days) ===
 {ctx['recent_news_summary']}
@@ -4035,29 +4742,47 @@ Smart Scanner (momentum/trend/strength): {ctx['smart_scanner']}
 === RECENT ORDER WINS / BIG DEALS (last 30 days news — contract awards, mergers, acquisitions, partnerships) ===
 {ctx['recent_order_wins_or_deals']}
 
-=== PREVIOUS QUARTER CONCALL (promises/guidance given at that time, user-provided) ===
+=== PREVIOUS QUARTER CONCALL (promises/guidance given at that time) ===
 {concall_prev_block}
 
-=== LATEST QUARTER CONCALL (current commentary + any update on old promises, user-provided) ===
+=== LATEST QUARTER CONCALL (current commentary + any update on old promises) ===
 {concall_latest_block}
 
-=== TASK ===
-Upar diye gaye data ke aadhar par ek structured "Deep Dive" report banao:
+=== TASK — Banao ek structured "Deep Dive" report, EXACTLY in yeh 8 sections (same headings), Hinglish mein: ===
 
-1. **Business Snapshot** (2-3 lines)
-2. **Recent Corporate Developments** — koi bhi naya order win, bada contract, merger/acquisition, partnership, ya important board decision jo corporate announcements ya deals news mein mila ho, bullet list mein highlight karo. Agar kuch nahi mila to "No major recent order wins or deals found in available data."
-3. **Financial Health** (Strong / Moderate / Weak) — revenue/profit trend, margin trend, debt signal — 2 line justification
-4. **Shareholding & Sentiment Read** — promoter/FII/DII trend ka matlab, news sentiment ka context
-5. **Promise vs Delivery Tracker** — ye sabse important section hai:
-   - Pichhle concall mein management ne jo specific promises/guidance diye the (revenue growth %, margin target, capex plan, new launches, debt reduction, etc.) unko bullet list mein nikalo
-   - Har promise ke saamne likho: **Delivered / Partially Delivered / Not Delivered / Not enough data to verify** — aur uska justification financial data ya latest concall se do
-   - Agar dono concall text provided nahi hain, to likho "Promise-tracking ke liye dono quarters ka concall text chahiye — abhi available nahi hai."
-6. **New Guidance for Future** — latest concall mein management ne aage ke liye kya naya guidance/promise diya hai (bullet points), aur management ka tone (confident/cautious/vague)
-7. **Red Flags** — scanner ke red flags ko explain karo plain language mein, plus koi aur pattern jo data mein dikh raha ho (including agar management baar baar promises miss kar raha hai to ye bhi ek red flag hai). Agar kuch nahi mila to "No major red flags identified in available data."
-8. **Key Risks to Watch** (3-4 bullets)
-9. **Data Gaps** — kya missing tha jisse analysis incomplete raha
+**1. कंपनी का परिचय और बिज़नेस मॉडल (Company Overview)**
+Company kya karti hai, kab se listed/operate kar rahi hai, apna core business kya hai — 3-4 lines mein.
 
-RULES: Kabhi "buy/sell/target price/guaranteed return" jaisi language use mat karo. Sirf diya gaya data use karo, bahar se numbers mat lao. Hinglish mein likho, concise rakho."""
+**2. Fundamental Analysis (Company ka Structure & Health)**
+- Business Model: Company paisa kaise kamaati hai — products/services, customers, core competitive advantage (Moat).
+- Financial Statements (aakhri 3-5 saal, upar diye gaye statements data se): P&L (revenue growth trend, OPM trend, Net Profit Margin trend), Balance Sheet (Total Debt, Reserves, Total Assets/Liabilities ka trend), Cash Flow (OCF positive hai ya nahi, aur FCF ka andaza — agar capex data available nahi hai to yeh clearly bolo).
+- Key Financial Ratios: Valuation (P/E, P/B, EV/EBITDA), Profitability (ROE, ROCE — ideal >15-20%), Debt (Debt-to-Equity — ideal <1 ya <0.5 — aur Interest Coverage agar data se nikal sakte ho, warna "data available nahi").
+
+**3. पिछले 3 तिमाहियों के वित्तीय परिणामों की तुलना (Last 3 Quarters Performance)**
+Upar diye gaye "LAST 3 QUARTERS" data se Sales/OPM/Net Profit/EPS ka quarter-by-quarter comparison, trend describe karo (improving/declining/stable).
+
+**4. Industry & Macro Environment (Market Analysis)**
+- TAM: Is industry mein growth potential kitna hai — general knowledge se batao, clearly flag karo ki yeh estimate/general knowledge hai.
+- Peer Comparison: Upar diye "PEER COMPARISON TABLE" data ka use karke is stock ke margins/valuation/growth ko peers ke against qualitatively compare karo (detailed table Section 8 mein banega).
+- Regulatory & Macro Risks: Government policies, duties, interest rates ka is business par asar — general knowledge se, flag karke.
+
+**5. Management & Governance (Quality Check)**
+- Promoter Holding & Pledging: Shareholding trend data se promoter % ka trend aur pledged % (agar row available hai).
+- Capital Allocation Track Record aur Corporate Governance (promoter compensation, related-party transactions, auditor reviews): agar data mein direct signal nahi hai to general knowledge se context do, clearly flag karke, aur bolo ki detailed governance check ke liye annual report dekhna chahiye.
+
+**6. Qualitative & Future Growth Catalysts**
+- Growth Drivers: agle 3-5 saal ke liye naye products/capacity expansion/market expansion — recent corporate announcements/deals data + general knowledge se.
+- Risks & Red Flags: customer concentration, raw material fluctuation, legal disputes — jo bhi data/general knowledge se pata chale.
+
+**7. Technicals & Entry Strategy (Timing)**
+Upar diye "TECHNICAL SNAPSHOT" se: Price trend (Bullish/Bearish/Sideways — EMA stack, ADX/DI se), key support/resistance levels, aur "SHAREHOLDING TREND" se FII/DII holding pichle quarters mein badh rahi hai ya ghat rahi hai.
+
+**8. Key Financial & Metric Comparison Table + Detailed Peer Comparison Analysis**
+Ek markdown table banao jisme yeh stock aur uske upar diye peers (PEER COMPARISON TABLE se) side-by-side ho — columns: Company, CMP, P/E, Market Cap, ROCE, Sales Growth, Net Profit Growth, Div Yield (jo bhi columns data mein available hain). Table ke neeche 3-4 lines mein likho ki is stock ka positioning peers ke against kaisa hai (premium/discount valuation, better/worse margins, etc.) — agar peer data available nahi hai to clearly likho "Peer comparison data Screener.in se available nahi ho paya is stock ke liye."
+
+Report ke end mein ek chhota **"Data Gaps"** section bhi do — kya missing tha jisse analysis incomplete raha (jaise: pledged data na hona, TAM ka exact number na hona, capex data na hona, dono concall na diye jaana, etc.)
+
+RULES: Kabhi "buy/sell/target price/guaranteed return" jaisi language use mat karo. General knowledge wale hisso ko hamesha clearly flag karo. Hinglish mein likho, har section concise rakho lekin section 2 aur 8 thoda detailed ho sakta hai."""
 
 
 def deepdive_call_claude(prompt: str) -> str:
@@ -4080,8 +4805,8 @@ def deepdive_call_claude(prompt: str) -> str:
             model=GEMINI_MODEL,
             contents=prompt,
             config=_genai_types.GenerateContentConfig(
-                max_output_tokens=4000,
-                thinking_config=_genai_types.ThinkingConfig(thinking_level="low"),
+                max_output_tokens=8000,
+                thinking_config=_genai_types.ThinkingConfig(thinking_level="medium"),
             ),
         )
         return response.text or "⚠️ Gemini se khali response mila."
@@ -4105,9 +4830,11 @@ def render_ai_deep_dive(symbol: str, c: Dict[str, Any], smart: Optional[Dict[str
     Call this from inside render_stock_detail()."""
     with st.expander("🤖 AI Deep Dive (Screener + Scanner + News combined)", expanded=False):
         st.caption(
-            "Ye app ke apne data (technical/fundamental score, Screener.in financials, "
-            "shareholding, news sentiment, NSE corporate announcements) ko combine karke Gemini se ek structured research "
-            "summary banata hai. Ye investment advice nahi hai."
+            "Ye app ke apne data (technical/fundamental score, Screener.in ke P&L/Balance Sheet/"
+            "Cash Flow/Ratios/Peers/Shareholding tables, news sentiment, NSE corporate announcements) "
+            "ko combine karke Gemini se ek structured 8-section research report banata hai — Company "
+            "Overview, Fundamentals, Last-3-Quarters, Industry & Peers, Management & Governance, "
+            "Growth Catalysts, Technicals, aur Peer Comparison Table. Ye investment advice nahi hai."
         )
         if st.button("📥 Auto-fetch concalls from Screener.in", key=f"dd_autofetch_{symbol}"):
             with st.spinner("Screener.in se concall transcripts dhoond rahe hain..."):
@@ -4147,7 +4874,7 @@ def render_ai_deep_dive(symbol: str, c: Dict[str, Any], smart: Optional[Dict[str
             run_dd = True
 
         if run_dd:
-            with st.spinner("Gathering data aur Gemini se analysis maang rahe hain..."):
+            with st.spinner("Screener (P&L/Balance Sheet/Cash Flow/Ratios/Peers) + Scanner + News data gather kar rahe hain, phir Gemini se analysis maang rahe hain..."):
                 ctx = deepdive_build_context(symbol, c, smart)
                 ctx_json = json.dumps(ctx, default=str, sort_keys=True)
                 result = deepdive_cached(symbol, ctx_json, concall_prev, concall_latest)
@@ -4157,9 +4884,10 @@ def render_ai_deep_dive(symbol: str, c: Dict[str, Any], smart: Optional[Dict[str
         if result:
             st.markdown(result)
             st.caption(
-                "⚠️ AI-generated research hai, available data par based. Investment advice nahi hai. "
-                "Apna independent research karein aur zaroorat pare to SEBI-registered advisor se consult karein."
+                "⚠️ AI-generated research hai, available data + AI ke general knowledge (jahan clearly flag kiya gaya hai) par based. "
+                "Investment advice nahi hai. Apna independent research karein aur zaroorat pare to SEBI-registered advisor se consult karein."
             )
+
 
 
 # ============================================================================
@@ -4389,6 +5117,29 @@ def render_stock_detail(symbol: str, smart_result: Optional[Dict[str, Any]] = No
 
     st.caption(f"🏢 Sector: **{c.get('sector','—')}**  ·  Industry: {c.get('industry','—')}")
 
+    with st.spinner("Last result declaration date NSE se check kar rahe hain..."):
+        result_info = fetch_last_result_announcement(c["base_symbol"])
+    rc1, rc2, rc3 = st.columns(3)
+    if result_info:
+        rc1.metric("📅 Last Result Declared", result_info["date"])
+        if result_info.get("next_date"):
+            rc1.markdown(f"**Next result date: {result_info['next_date']}**")
+        price_since = compute_price_change_since(c["symbol"], result_info["raw_date"])
+        if price_since and price_since.get("pct_change") is not None:
+            rc2.metric(
+                f"Close on result date ({price_since['base_date']})",
+                f"₹{price_since['base_close']:.2f}",
+            )
+            rc3.metric(
+                f"Latest close ({price_since['latest_date']})",
+                f"₹{price_since['latest_close']:.2f}",
+                f"{price_since['pct_change']:+.2f}% since result",
+            )
+        else:
+            rc2.caption("Result-date ke price ka lookup fail hua (price history se match nahi mila).")
+    else:
+        rc1.caption("📅 Last result declaration date NSE se nahi mil paayi is stock ke liye (announcement API blocked/rate-limited ho sakta hai, ya recent result nahi mila).")
+
     b1, b2 = st.columns(2)
     with b1:
         if st.button("⭐ Add to Watchlist", key=f"wl_{symbol}", use_container_width=True):
@@ -4481,6 +5232,37 @@ def render_stock_detail(symbol: str, smart_result: Optional[Dict[str, Any]] = No
             st.dataframe(pd.DataFrame(smart['signal_table']), use_container_width=True, hide_index=True)
     else:
         st.caption("Smart Scanner score could not be computed for this stock (insufficient price history or fetch failed).")
+
+    with st.expander("📈 Result Reaction — Quarter-to-Quarter move (result date close → next result date close)"):
+        qq_col1, qq_col2 = st.columns([5, 1])
+        qq_col1.caption(
+            "Har result date ke closing price se agle result date ke closing price tak ka % move "
+            "(NSE board meetings + Yahoo prices). Latest result ki row 'Ongoing' hai — wo aaj tak ke latest close tak chalti hai."
+        )
+        if qq_col2.button("🔄", key=f"qq_refresh_{symbol}", help="Force refresh (clears cached result dates/prices for all stocks)"):
+            _all_result_dates_cached.clear()
+            _quarter_moves_cached.clear()
+
+        with st.spinner("Result dates (NSE) aur prices (Yahoo) fetch ho rahe hain..."):
+            qq = fetch_quarter_to_quarter_moves(c["symbol"])
+
+        if qq and qq.get("rows"):
+            qq_rows = []
+            for r in reversed(qq["rows"][-8:]):  # newest first, last 8 quarters
+                icon = "🟢" if r["pct"] >= 0 else "🔴"
+                qq_rows.append({
+                    "Result Date": r["result_date"],
+                    "Close on Result Date": f"₹{r['base_close']:.2f}",
+                    "Period End": r["end_date"] + (" (latest)" if r["status"] == "Ongoing" else ""),
+                    "Close at Period End": f"₹{r['end_close']:.2f}",
+                    "Move": f"{icon} {r['pct']:+.2f}%",
+                    "Status": r["status"],
+                })
+            st.dataframe(pd.DataFrame(qq_rows), use_container_width=True, hide_index=True)
+            if qq.get("next_date"):
+                st.markdown(f"**Next result date: {qq['next_date']}**")
+        else:
+            st.caption("Quarter-to-quarter data nahi mil paaya (NSE result dates ya price history fetch fail hui). 🔄 dabakar dobara try karo.")
 
     with st.expander("📋 Fundamental snapshot (EPS/OPM/Sales/PAT/PBT/EBITDA/Cash Flow — QoQ & YoY)"):
         fin_col1, fin_col2 = st.columns([5, 1])
