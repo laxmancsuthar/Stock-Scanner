@@ -2447,7 +2447,7 @@ def _get_nse_client():
     cookie_dir = Path(tempfile.gettempdir()) / "nse_cookies"
     cookie_dir.mkdir(parents=True, exist_ok=True)
     try:
-        return _NSEClient(download_folder=str(cookie_dir), server=NSE_RUN_ON_SERVER, timeout=15)
+        return _NSEClient(download_folder=str(cookie_dir), use_http2=NSE_RUN_ON_SERVER, timeout=15)
     except Exception:
         return None
 
@@ -3003,7 +3003,7 @@ def fetch_all_deals_raw(deal_type: str = "bulk", days: int = 90) -> List[Dict[st
     while chunk_end > start_dt:
         chunk_start = max(start_dt, chunk_end - timedelta(days=chunk_days))
         try:
-            rows = client.bulkdeals(option_type, chunk_start, chunk_end)
+            rows = client.bulk_deals(option_type, chunk_start.date(), chunk_end.date())
         except RuntimeError:
             rows = []  # no deals in this particular chunk — not an error
         except Exception:
@@ -3162,7 +3162,7 @@ def _fetch_bhavcopy_day(date_str: str) -> Optional[pd.DataFrame]:
         return None
     date_obj = datetime.strptime(date_str, "%Y-%m-%d")
     try:
-        path = client.deliveryBhavcopy(date_obj)
+        path = client.delivery_bhavcopy(date_obj.date())
         df = pd.read_csv(path)
         df.columns = [c.strip() for c in df.columns]
         return df
