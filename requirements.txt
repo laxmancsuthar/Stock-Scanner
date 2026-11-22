@@ -11,3 +11,4 @@ nse
 httpx[http2]
 bseindia
 google-genai
+nse>=5.0
